@@ -45,7 +45,7 @@ use futures::lock::{MappedMutexGuard as AsyncMappedMutexGuard, Mutex as AsyncMut
 use futures::{FutureExt, TryFutureExt};
 use futures01::Future;
 use http::{Response, StatusCode};
-use rpc::v1::types::Bytes as BytesJson;
+use rpc::v1::types::{Bytes as BytesJson, H256 as H256Json};
 use serde::{Deserialize, Deserializer};
 use serde_json::{self as json, Value as Json};
 use std::collections::hash_map::{HashMap, RawEntryMut};
@@ -83,6 +83,7 @@ use eth::{eth_coin_from_conf_and_request, EthCoin, EthTxFeeDetails, SignedEthTx}
 
 pub mod utxo;
 use utxo::qtum::{self, qtum_coin_from_conf_and_request, QtumCoin};
+use utxo::slp::SlpToken;
 use utxo::utxo_common::big_decimal_from_sat_unsigned;
 use utxo::utxo_standard::{utxo_standard_coin_from_conf_and_request, UtxoStandardCoin};
 use utxo::{GenerateTxError, UtxoFeeDetails, UtxoTx};
@@ -866,6 +867,7 @@ pub enum MmCoinEnum {
     EthCoin(EthCoin),
     #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
     ZCoin(ZCoin),
+    SlpToken(SlpToken),
     Test(TestCoin),
 }
 
@@ -889,6 +891,10 @@ impl From<Qrc20Coin> for MmCoinEnum {
     fn from(c: Qrc20Coin) -> MmCoinEnum { MmCoinEnum::Qrc20Coin(c) }
 }
 
+impl From<SlpToken> for MmCoinEnum {
+    fn from(c: SlpToken) -> MmCoinEnum { MmCoinEnum::SlpToken(c) }
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
 impl From<ZCoin> for MmCoinEnum {
     fn from(c: ZCoin) -> MmCoinEnum { MmCoinEnum::ZCoin(c) }
@@ -903,6 +909,7 @@ impl Deref for MmCoinEnum {
             MmCoinEnum::QtumCoin(ref c) => c,
             MmCoinEnum::Qrc20Coin(ref c) => c,
             MmCoinEnum::EthCoin(ref c) => c,
+            MmCoinEnum::SlpToken(ref c) => c,
             #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
             MmCoinEnum::ZCoin(ref c) => c,
             MmCoinEnum::Test(ref c) => c,
@@ -975,6 +982,13 @@ pub enum CoinProtocol {
     ERC20 {
         platform: String,
         contract_address: String,
+    },
+    SlpToken {
+        platform: String,
+        token_id: H256Json,
+        decimals: u8,
+        required_confirmations: Option<u64>,
+        address_prefix: String,
     },
     #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
     ZHTLC,
@@ -1182,6 +1196,30 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
                     .await
             )
             .into()
+        },
+        CoinProtocol::SlpToken {
+            platform,
+            token_id,
+            decimals,
+            required_confirmations,
+            address_prefix,
+        } => {
+            let platform_coin = try_s!(lp_coinfind(ctx, &platform).await);
+            let platform_utxo = match platform_coin {
+                Some(MmCoinEnum::UtxoCoin(coin)) => coin.clone(),
+                Some(_) => return ERR!("Platform coin {} is not UtxoCoin", platform),
+                None => return ERR!("Platform coin {} is not activated", platform),
+            };
+            let confs = required_confirmations.unwrap_or(platform_utxo.required_confirmations());
+            let token = SlpToken::new(
+                *decimals,
+                ticker.into(),
+                token_id.clone().into(),
+                platform_utxo,
+                confs,
+                address_prefix.clone(),
+            );
+            token.into()
         },
         #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
         CoinProtocol::ZHTLC => try_s!(z_coin_from_conf_and_request(ctx, ticker, &coins_en, req, secret).await).into(),
@@ -1640,5 +1678,7 @@ pub fn address_by_coin_conf_and_pubkey_str(coin: &str, conf: &Json, pubkey: &str
         },
         #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
         CoinProtocol::ZHTLC => utxo::address_by_conf_and_pubkey_str(coin, conf, pubkey),
+        // TODO return the slp prefixed cash address here
+        CoinProtocol::SlpToken { .. } => unimplemented!(),
     }
 }

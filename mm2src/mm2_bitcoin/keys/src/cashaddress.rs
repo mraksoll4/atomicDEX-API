@@ -18,6 +18,7 @@ pub enum NetworkPrefix {
     BitcoinCash,
     BchTest,
     BchReg,
+    SlpTest,
 }
 
 impl fmt::Display for NetworkPrefix {
@@ -26,6 +27,7 @@ impl fmt::Display for NetworkPrefix {
             NetworkPrefix::BitcoinCash => "bitcoincash",
             NetworkPrefix::BchTest => "bchtest",
             NetworkPrefix::BchReg => "bchreg",
+            NetworkPrefix::SlpTest => "slptest",
         };
         write!(f, "{}", as_str)
     }
@@ -40,6 +42,7 @@ impl FromStr for NetworkPrefix {
             "bitcoincash" => NetworkPrefix::BitcoinCash,
             "bchtest" => NetworkPrefix::BchTest,
             "bchreg" => NetworkPrefix::BchReg,
+            "slptest" => NetworkPrefix::SlpTest,
             _ => return Err("Unexpected network prefix".into()),
         };
         Ok(prefix)

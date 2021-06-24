@@ -6,8 +6,9 @@ use crate::utxo::utxo_common::{self, big_decimal_from_sat_unsigned, generate_tra
 use crate::utxo::{generate_and_send_tx, sat_from_big_decimal, FeePolicy, GenerateTxError, RecentlySpentOutPoints,
                   UtxoCommonOps, UtxoTx};
 use crate::{BalanceError, BalanceFut, CoinBalance, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps,
-            MmCoin, NegotiateSwapContractAddrErr, NumConversError, SwapOps, TradeFee, TradePreimageFut,
-            TradePreimageValue, TransactionEnum, TransactionFut, ValidateAddressResult, WithdrawFut, WithdrawRequest};
+            MmCoin, NegotiateSwapContractAddrErr, NumConversError, SwapOps, TradeFee, TradePreimageError,
+            TradePreimageFut, TradePreimageValue, TransactionEnum, TransactionFut, ValidateAddressResult, WithdrawFut,
+            WithdrawRequest};
 
 use bitcoin_cash_slp::{slp_send_output, SlpTokenType, TokenId};
 use bitcrypto::dhash160;
@@ -21,6 +22,7 @@ use futures::compat::Future01CompatExt;
 use futures::lock::MutexGuard as AsyncMutexGuard;
 use futures::{FutureExt, TryFutureExt};
 use futures01::Future;
+use keys::hash::H160;
 use keys::Public;
 use primitives::hash::H256;
 use rpc::v1::types::Bytes as BytesJson;
@@ -30,7 +32,7 @@ use serde_json::Value as Json;
 use serialization::{deserialize, serialize, Deserializable, Error, Reader};
 use serialization_derive::Deserializable;
 use std::convert::TryInto;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 const SLP_SWAP_VOUT: usize = 1;
@@ -42,6 +44,7 @@ pub struct SlpTokenConf {
     ticker: String,
     token_id: H256,
     required_confirmations: AtomicU64,
+    address_prefix: String,
 }
 
 #[derive(Clone, Debug)]
@@ -163,12 +166,14 @@ impl SlpToken {
         token_id: H256,
         platform_utxo: UtxoStandardCoin,
         required_confirmations: u64,
+        address_prefix: String,
     ) -> SlpToken {
         let conf = Arc::new(SlpTokenConf {
             decimals,
             ticker,
             token_id,
             required_confirmations: AtomicU64::new(required_confirmations),
+            address_prefix,
         });
         SlpToken { conf, platform_utxo }
     }
@@ -273,7 +278,11 @@ impl SlpToken {
         }
 
         if total_slp_input < total_slp_output {
-            return MmError::err(GenSlpSpendErr::InsufficientSlpBalance);
+            return MmError::err(GenSlpSpendErr::InsufficientSlpBalance {
+                coin: self.ticker().into(),
+                required: big_decimal_from_sat_unsigned(total_slp_output, self.decimals()),
+                available: big_decimal_from_sat_unsigned(total_slp_input, self.decimals()),
+            });
         }
         let change = total_slp_input - total_slp_output;
 
@@ -297,13 +306,13 @@ impl SlpToken {
         let mut outputs = vec![op_return_out_mm];
 
         outputs.extend(slp_outputs.into_iter().map(|spend_to| TransactionOutput {
-            value: self.dust(),
+            value: self.platform_dust(),
             script_pubkey: spend_to.script_pubkey,
         }));
 
         if change > 0 {
             let slp_change_out = TransactionOutput {
-                value: self.dust(),
+                value: self.platform_dust(),
                 script_pubkey: ScriptBuilder::build_p2pkh(&self.platform_utxo.my_public_key().address_hash())
                     .to_bytes(),
             };
@@ -374,7 +383,6 @@ impl SlpToken {
             _ => return MmError::err(ValidateHtlcError::InvalidSlpDetails),
         }
 
-        let dust_decimal = big_decimal_from_sat_unsigned(self.dust(), self.platform_utxo.decimals());
         let validate_fut = utxo_common::validate_payment(
             self.platform_utxo.clone(),
             tx,
@@ -382,7 +390,7 @@ impl SlpToken {
             other_pub,
             self.platform_utxo.my_public_key(),
             secret_hash,
-            dust_decimal,
+            self.platform_dust_dec(),
             time_lock,
         );
 
@@ -512,7 +520,7 @@ impl SlpToken {
 
         let my_script_pubkey = ScriptBuilder::build_p2pkh(&self.platform_utxo.my_public_key().address_hash());
         let slp_output = TransactionOutput {
-            value: self.dust(),
+            value: self.platform_dust(),
             script_pubkey: my_script_pubkey.to_bytes(),
         };
         outputs.push(slp_output);
@@ -626,13 +634,12 @@ impl SlpToken {
             _ => return MmError::err(ValidateDexFeeError::InvalidSlpDetails),
         }
 
-        let dust_decimal = big_decimal_from_sat_unsigned(self.dust(), self.platform_utxo.decimals());
         let validate_fut = utxo_common::validate_fee(
             self.platform_utxo.clone(),
             tx,
             SLP_FEE_VOUT,
             expected_sender,
-            &dust_decimal,
+            &self.platform_dust_dec(),
             min_block_number,
             fee_addr,
         );
@@ -645,7 +652,13 @@ impl SlpToken {
         Ok(())
     }
 
-    pub fn dust(&self) -> u64 { self.platform_utxo.as_ref().dust_amount }
+    pub fn platform_dust(&self) -> u64 { self.platform_utxo.as_ref().dust_amount }
+
+    pub fn platform_decimals(&self) -> u8 { self.platform_utxo.as_ref().decimals }
+
+    pub fn platform_dust_dec(&self) -> BigDecimal {
+        big_decimal_from_sat_unsigned(self.platform_dust(), self.platform_decimals())
+    }
 
     pub fn decimals(&self) -> u8 { self.conf.decimals }
 
@@ -816,7 +829,17 @@ impl From<SlpUnspentsErr> for BalanceError {
 #[derive(Debug, Display)]
 enum GenSlpSpendErr {
     GetUnspentsErr(SlpUnspentsErr),
-    InsufficientSlpBalance,
+    #[display(
+        fmt = "Not enough {} to generate SLP spend: available {}, required at least {}",
+        coin,
+        available,
+        required
+    )]
+    InsufficientSlpBalance {
+        coin: String,
+        available: BigDecimal,
+        required: BigDecimal,
+    },
 }
 
 impl From<SlpUnspentsErr> for GenSlpSpendErr {
@@ -826,7 +849,15 @@ impl From<SlpUnspentsErr> for GenSlpSpendErr {
 impl MarketCoinOps for SlpToken {
     fn ticker(&self) -> &str { &self.conf.ticker }
 
-    fn my_address(&self) -> Result<String, String> { unimplemented!() }
+    fn my_address(&self) -> Result<String, String> {
+        let platform_conf = &self.platform_utxo.as_ref().conf;
+        let slp_address = try_s!(self.platform_utxo.as_ref().my_address.to_cashaddress(
+            &self.conf.address_prefix,
+            platform_conf.pub_addr_prefix,
+            platform_conf.p2sh_addr_prefix
+        ));
+        slp_address.encode()
+    }
 
     fn my_balance(&self) -> BalanceFut<CoinBalance> {
         let coin = self.clone();
@@ -1172,6 +1203,23 @@ impl SwapOps for SlpToken {
     }
 }
 
+impl From<GenSlpSpendErr> for TradePreimageError {
+    fn from(slp: GenSlpSpendErr) -> TradePreimageError {
+        match slp {
+            GenSlpSpendErr::InsufficientSlpBalance {
+                coin,
+                available,
+                required,
+            } => TradePreimageError::NotSufficientBalance {
+                coin,
+                available,
+                required,
+            },
+            GenSlpSpendErr::GetUnspentsErr(e) => TradePreimageError::InternalError(e.to_string()),
+        }
+    }
+}
+
 impl MmCoin for SlpToken {
     fn is_asset_chain(&self) -> bool { false }
 
@@ -1190,21 +1238,90 @@ impl MmCoin for SlpToken {
     /// Get fee to be paid per 1 swap transaction
     fn get_trade_fee(&self) -> Box<dyn Future<Item = TradeFee, Error = String> + Send> { unimplemented!() }
 
-    fn get_sender_trade_fee(&self, _value: TradePreimageValue, _stage: FeeApproxStage) -> TradePreimageFut<TradeFee> {
-        unimplemented!()
+    fn get_sender_trade_fee(&self, value: TradePreimageValue, stage: FeeApproxStage) -> TradePreimageFut<TradeFee> {
+        let coin = self.clone();
+        let fut = async move {
+            let slp_amount = match value {
+                TradePreimageValue::Exact(decimal) | TradePreimageValue::UpperBound(decimal) => {
+                    sat_from_big_decimal(&decimal, coin.decimals())?
+                },
+            };
+            // can use dummy P2SH script_pubkey here
+            let script_pubkey = ScriptBuilder::build_p2sh(&H160::default()).into();
+            let slp_out = SlpOutput {
+                amount: slp_amount,
+                script_pubkey,
+            };
+            let preimage = coin.generate_slp_tx_preimage(vec![slp_out]).await?;
+            let fee = utxo_common::preimage_trade_fee_required_to_send_outputs(
+                &coin.platform_utxo,
+                preimage.outputs,
+                FeePolicy::SendExact,
+                None,
+                &stage,
+            )
+            .await?;
+            Ok(TradeFee {
+                coin: coin.platform_utxo.ticker().into(),
+                amount: fee.into(),
+                paid_from_trading_vol: false,
+            })
+        };
+
+        Box::new(fut.boxed().compat())
     }
 
-    fn get_receiver_trade_fee(&self, _stage: FeeApproxStage) -> TradePreimageFut<TradeFee> { unimplemented!() }
+    fn get_receiver_trade_fee(&self, _stage: FeeApproxStage) -> TradePreimageFut<TradeFee> {
+        let coin = self.clone();
+
+        let fut = async move {
+            let htlc_fee = coin.platform_utxo.get_htlc_spend_fee().await?;
+            let amount =
+                (big_decimal_from_sat_unsigned(htlc_fee, coin.platform_decimals()) + coin.platform_dust_dec()).into();
+            Ok(TradeFee {
+                coin: coin.platform_utxo.ticker().into(),
+                amount,
+                paid_from_trading_vol: false,
+            })
+        };
+
+        Box::new(fut.boxed().compat())
+    }
 
     fn get_fee_to_send_taker_fee(
         &self,
-        _dex_fee_amount: BigDecimal,
-        _stage: FeeApproxStage,
+        dex_fee_amount: BigDecimal,
+        stage: FeeApproxStage,
     ) -> TradePreimageFut<TradeFee> {
-        unimplemented!()
+        let coin = self.clone();
+        let fut = async move {
+            let slp_amount = sat_from_big_decimal(&dex_fee_amount, coin.decimals())?;
+            // can use dummy P2PKH script_pubkey here
+            let script_pubkey = ScriptBuilder::build_p2pkh(&H160::default()).into();
+            let slp_out = SlpOutput {
+                amount: slp_amount,
+                script_pubkey,
+            };
+            let preimage = coin.generate_slp_tx_preimage(vec![slp_out]).await?;
+            let fee = utxo_common::preimage_trade_fee_required_to_send_outputs(
+                &coin.platform_utxo,
+                preimage.outputs,
+                FeePolicy::SendExact,
+                None,
+                &stage,
+            )
+            .await?;
+            Ok(TradeFee {
+                coin: coin.platform_utxo.ticker().into(),
+                amount: fee.into(),
+                paid_from_trading_vol: false,
+            })
+        };
+
+        Box::new(fut.boxed().compat())
     }
 
-    fn required_confirmations(&self) -> u64 { 1 }
+    fn required_confirmations(&self) -> u64 { self.conf.required_confirmations.load(AtomicOrdering::Relaxed) }
 
     fn requires_notarization(&self) -> bool { false }
 
@@ -1332,7 +1449,7 @@ mod slp_tests {
         println!("{}", address);
 
         let token_id = H256::from("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7");
-        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0);
+        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0, "slptest".into());
 
         let fusd_balance = fusd.my_balance().wait().unwrap();
         println!("FUSD {}", fusd_balance.spendable);
@@ -1406,7 +1523,7 @@ mod slp_tests {
         println!("{}", address);
 
         let token_id = H256::from("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7");
-        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0);
+        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0, "slptest".into());
 
         let fusd_balance = fusd.my_balance().wait().unwrap();
         println!("FUSD {}", fusd_balance.spendable);
@@ -1427,5 +1544,42 @@ mod slp_tests {
             .unwrap();
         println!("refund hex {}", hex::encode(refund_tx.tx_hex()));
         println!("refund hash {}", hex::encode(refund_tx.tx_hash().0));
+    }
+
+    #[test]
+    fn test_slp_address() {
+        let ctx = MmCtxBuilder::default().into_mm_arc();
+        let keypair = key_pair_from_seed("BCH SLP test").unwrap();
+
+        let conf = json!({"coin":"BCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},
+         "address_format":{"format":"cashaddress","network":"bchtest"}});
+        let req = json!({
+            "method": "electrum",
+            "coin": "BCH",
+            "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"},{"url":"tbch.loping.net:60001"}],
+        });
+        let bch = block_on(utxo_standard_coin_from_conf_and_request(
+            &ctx,
+            "BCH",
+            &conf,
+            &req,
+            &*keypair.private().secret,
+        ))
+        .unwrap();
+
+        let balance = bch.my_balance().wait().unwrap();
+        println!("{}", balance.spendable);
+
+        let address = bch.my_address().unwrap();
+        println!("{}", address);
+
+        let token_id = H256::from("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7");
+        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0, "slptest".into());
+
+        let fusd_balance = fusd.my_balance().wait().unwrap();
+        println!("FUSD {}", fusd_balance.spendable);
+
+        let slp_address = fusd.my_address().unwrap();
+        assert_eq!("slptest:qzx0llpyp8gxxsmad25twksqnwd62xm3lsg8lecug8", slp_address);
     }
 }

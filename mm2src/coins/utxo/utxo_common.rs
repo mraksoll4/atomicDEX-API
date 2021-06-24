@@ -26,7 +26,7 @@ use serialization::{deserialize, serialize, CoinVariant};
 use std::cmp::Ordering;
 use std::collections::hash_map::{Entry, HashMap};
 use std::str::FromStr;
-use std::sync::atomic::Ordering as AtomicOrderding;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 pub use chain::Transaction as UtxoTx;
 
@@ -2243,23 +2243,23 @@ where
 }
 
 pub fn required_confirmations(coin: &UtxoCoinFields) -> u64 {
-    coin.conf.required_confirmations.load(AtomicOrderding::Relaxed)
+    coin.conf.required_confirmations.load(AtomicOrdering::Relaxed)
 }
 
 pub fn requires_notarization(coin: &UtxoCoinFields) -> bool {
-    coin.conf.requires_notarization.load(AtomicOrderding::Relaxed)
+    coin.conf.requires_notarization.load(AtomicOrdering::Relaxed)
 }
 
 pub fn set_required_confirmations(coin: &UtxoCoinFields, confirmations: u64) {
     coin.conf
         .required_confirmations
-        .store(confirmations, AtomicOrderding::Relaxed);
+        .store(confirmations, AtomicOrdering::Relaxed);
 }
 
 pub fn set_requires_notarization(coin: &UtxoCoinFields, requires_nota: bool) {
     coin.conf
         .requires_notarization
-        .store(requires_nota, AtomicOrderding::Relaxed);
+        .store(requires_nota, AtomicOrdering::Relaxed);
 }
 
 #[allow(clippy::needless_lifetimes)]

@@ -1054,14 +1054,18 @@ fn test_rpc_password_from_json_no_userpass() {
 /// Trades few pairs concurrently to speed up the process and also act like "load" test
 async fn trade_base_rel_electrum(pairs: &[(&'static str, &'static str)]) {
     let bob_passphrase = get_passphrase(&".env.seed", "BOB_PASSPHRASE").unwrap();
-    let alice_passphrase = get_passphrase(&".env.client", "ALICE_PASSPHRASE").unwrap();
+    let alice_passphrase = "BCH SLP test";
 
     let coins = json! ([
         {"coin":"RICK","asset":"RICK","required_confirmations":0,"txversion":4,"overwintered":1,"protocol":{"type":"UTXO"}},
         {"coin":"MORTY","asset":"MORTY","required_confirmations":0,"txversion":4,"overwintered":1,"protocol":{"type":"UTXO"}},
         {"coin":"ETH","name":"ethereum","protocol":{"type":"ETH"}},
         {"coin":"ZOMBIE","asset":"ZOMBIE","fname":"ZOMBIE (TESTCOIN)","txversion":4,"overwintered":1,"mm2":1,"protocol":{"type":"ZHTLC"}},
-        {"coin":"JST","name":"jst","protocol":{"type":"ERC20","protocol_data":{"platform":"ETH","contract_address":"0x2b294F029Fde858b2c62184e8390591755521d8E"}}}
+        {"coin":"JST","name":"jst","protocol":{"type":"ERC20","protocol_data":{"platform":"ETH","contract_address":"0x2b294F029Fde858b2c62184e8390591755521d8E"}}},
+        {"coin":"tBCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},"required_confirmations":0,
+         "address_format":{"format":"cashaddress","network":"bchtest"}},
+        {"coin":"FUSD","protocol":{"type":"SlpToken","protocol_data":{"decimals":4,"token_id":"bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7",
+         "platform":"tBCH","address_prefix":"slptest"}}}
     ]);
 
     let mut mm_bob = MarketMakerIt::start(
@@ -1134,6 +1138,13 @@ async fn trade_base_rel_electrum(pairs: &[(&'static str, &'static str)]) {
     // Enable coins on Alice side. Print the replies in case we need the address.
     let rc = enable_coins_eth_electrum(&mm_alice, &["http://195.201.0.6:8565"]).await;
     log! ({"enable_coins (alice): {:?}", rc});
+
+    enable_electrum(&mm_bob, "tBCH", false, &["tbch.loping.net:60001"]).await;
+
+    enable_electrum(&mm_alice, "tBCH", false, &["tbch.loping.net:60001"]).await;
+
+    enable_native(&mm_bob, "FUSD", &[]).await;
+    enable_native(&mm_alice, "FUSD", &[]).await;
 
     // unwrap! (mm_alice.wait_for_log (999., &|log| log.contains ("set pubkey for ")));
 
@@ -1301,7 +1312,7 @@ fn trade_test_electrum_and_eth_coins() {
     let pairs: &[_] = if cfg!(feature = "zhtlc") {
         &[("ETH", "JST"), ("RICK", "ZOMBIE")]
     } else {
-        &[("ETH", "JST")]
+        &[("RICK", "FUSD")]
     };
     block_on(trade_base_rel_electrum(pairs));
 }
@@ -3775,7 +3786,7 @@ fn test_withdraw_cashaddresses() {
         "userpass": mm.userpass,
         "method": "electrum",
         "coin": "BCH",
-        "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"}],
+        "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"},{"url":"tbch.loping.net:60001"}],
         "mm2": 1,
     })))
     .unwrap();
