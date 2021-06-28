@@ -1318,7 +1318,15 @@ pub fn current_block(coin: &UtxoCoinFields) -> Box<dyn Future<Item = u64, Error 
     Box::new(coin.rpc_client.get_block_count().map_err(|e| ERRL!("{}", e)))
 }
 
-pub fn address_from_pubkey_str<T>(coin: &T, pubkey: &str) -> Result<String, String>
+pub fn display_address_from_pubkey_str<T>(coin: &T, pubkey: &str) -> Result<String, String>
+where
+    T: AsRef<UtxoCoinFields> + UtxoCommonOps,
+{
+    let addr = try_s!(address_from_pubkey_str(coin, pubkey));
+    coin.display_address(&addr)
+}
+
+pub fn address_from_pubkey_str<T>(coin: &T, pubkey: &str) -> Result<Address, String>
 where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
@@ -1329,7 +1337,7 @@ where
         coin.as_ref().conf.pub_t_addr_prefix,
         coin.as_ref().conf.checksum_type
     ));
-    coin.display_address(&addr)
+    Ok(addr)
 }
 
 pub fn display_priv_key(coin: &UtxoCoinFields) -> String { format!("{}", coin.key_pair.private()) }

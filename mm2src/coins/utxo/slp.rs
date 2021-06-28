@@ -14,6 +14,7 @@ use bitcoin_cash_slp::{slp_send_output, SlpTokenType, TokenId};
 use bitcrypto::dhash160;
 use chain::constants::SEQUENCE_FINAL;
 use chain::{OutPoint, TransactionOutput};
+use common::log::warn;
 use common::mm_ctx::MmArc;
 use common::mm_error::prelude::*;
 use common::mm_number::{BigDecimal, MmNumber};
@@ -23,7 +24,7 @@ use futures::lock::MutexGuard as AsyncMutexGuard;
 use futures::{FutureExt, TryFutureExt};
 use futures01::Future;
 use keys::hash::H160;
-use keys::Public;
+use keys::{Address, CashAddress, NetworkPrefix as CashAddrPrefix, Public};
 use primitives::hash::H256;
 use rpc::v1::types::Bytes as BytesJson;
 use script::bytes::Bytes;
@@ -44,7 +45,7 @@ pub struct SlpTokenConf {
     ticker: String,
     token_id: H256,
     required_confirmations: AtomicU64,
-    address_prefix: String,
+    address_prefix: CashAddrPrefix,
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +167,7 @@ impl SlpToken {
         token_id: H256,
         platform_utxo: UtxoStandardCoin,
         required_confirmations: u64,
-        address_prefix: String,
+        address_prefix: CashAddrPrefix,
     ) -> SlpToken {
         let conf = Arc::new(SlpTokenConf {
             decimals,
@@ -663,6 +664,16 @@ impl SlpToken {
     pub fn decimals(&self) -> u8 { self.conf.decimals }
 
     pub fn token_id(&self) -> &H256 { &self.conf.token_id }
+
+    pub fn slp_address(&self, address: &Address) -> Result<CashAddress, String> {
+        let platform_conf = &self.platform_utxo.as_ref().conf;
+        let slp_address = try_s!(address.to_cashaddress(
+            &self.conf.address_prefix.to_string(),
+            platform_conf.pub_addr_prefix,
+            platform_conf.p2sh_addr_prefix
+        ));
+        Ok(slp_address)
+    }
 }
 
 /// https://slp.dev/specs/slp-token-type-1/#transaction-detail
@@ -850,12 +861,7 @@ impl MarketCoinOps for SlpToken {
     fn ticker(&self) -> &str { &self.conf.ticker }
 
     fn my_address(&self) -> Result<String, String> {
-        let platform_conf = &self.platform_utxo.as_ref().conf;
-        let slp_address = try_s!(self.platform_utxo.as_ref().my_address.to_cashaddress(
-            &self.conf.address_prefix,
-            platform_conf.pub_addr_prefix,
-            platform_conf.p2sh_addr_prefix
-        ));
+        let slp_address = try_s!(self.slp_address(&self.platform_utxo.as_ref().my_address));
         slp_address.encode()
     }
 
@@ -916,7 +922,11 @@ impl MarketCoinOps for SlpToken {
 
     fn current_block(&self) -> Box<dyn Future<Item = u64, Error = String> + Send> { self.platform_utxo.current_block() }
 
-    fn address_from_pubkey_str(&self, _pubkey: &str) -> Result<String, String> { unimplemented!() }
+    fn address_from_pubkey_str(&self, pubkey: &str) -> Result<String, String> {
+        let addr = try_s!(utxo_common::address_from_pubkey_str(&self.platform_utxo, pubkey));
+        let slp_address = try_s!(self.slp_address(&addr));
+        slp_address.encode()
+    }
 
     fn display_priv_key(&self) -> String { self.platform_utxo.display_priv_key() }
 
@@ -1227,16 +1237,48 @@ impl MmCoin for SlpToken {
 
     fn decimals(&self) -> u8 { self.decimals() }
 
-    fn convert_to_address(&self, _from: &str, _to_address_format: Json) -> Result<String, String> { unimplemented!() }
+    fn convert_to_address(&self, from: &str, to_address_format: Json) -> Result<String, String> {
+        utxo_common::convert_to_address(&self.platform_utxo, from, to_address_format)
+    }
 
-    fn validate_address(&self, _address: &str) -> ValidateAddressResult { unimplemented!() }
+    fn validate_address(&self, address: &str) -> ValidateAddressResult {
+        let cash_address = match CashAddress::decode(address) {
+            Ok(a) => a,
+            Err(e) => {
+                return ValidateAddressResult {
+                    is_valid: false,
+                    reason: Some(format!("Error {} on parsing the {} as cash address", e, address)),
+                }
+            },
+        };
 
-    fn process_history_loop(&self, _ctx: MmArc) -> Box<dyn Future<Item = (), Error = ()> + Send> { unimplemented!() }
+        if cash_address.prefix == self.conf.address_prefix {
+            ValidateAddressResult {
+                is_valid: true,
+                reason: None,
+            }
+        } else {
+            ValidateAddressResult {
+                is_valid: false,
+                reason: Some(format!(
+                    "Address {} has invalid prefix {}, expected {}",
+                    address, cash_address.prefix, self.conf.address_prefix
+                )),
+            }
+        }
+    }
 
-    fn history_sync_status(&self) -> HistorySyncState { unimplemented!() }
+    fn process_history_loop(&self, _ctx: MmArc) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+        warn!("process_history_loop is not implemented for SLP yet!");
+        Box::new(futures01::future::err(()))
+    }
+
+    fn history_sync_status(&self) -> HistorySyncState { HistorySyncState::NotEnabled }
 
     /// Get fee to be paid per 1 swap transaction
-    fn get_trade_fee(&self) -> Box<dyn Future<Item = TradeFee, Error = String> + Send> { unimplemented!() }
+    fn get_trade_fee(&self) -> Box<dyn Future<Item = TradeFee, Error = String> + Send> {
+        utxo_common::get_trade_fee(self.platform_utxo.clone())
+    }
 
     fn get_sender_trade_fee(&self, value: TradePreimageValue, stage: FeeApproxStage) -> TradePreimageFut<TradeFee> {
         let coin = self.clone();

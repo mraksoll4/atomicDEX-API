@@ -1210,6 +1210,8 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
                 Some(_) => return ERR!("Platform coin {} is not UtxoCoin", platform),
                 None => return ERR!("Platform coin {} is not activated", platform),
             };
+
+            let prefix = try_s!(address_prefix.parse());
             let confs = required_confirmations.unwrap_or(platform_utxo.required_confirmations());
             let token = SlpToken::new(
                 *decimals,
@@ -1217,7 +1219,7 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
                 token_id.clone().into(),
                 platform_utxo,
                 confs,
-                address_prefix.clone(),
+                prefix,
             );
             token.into()
         },

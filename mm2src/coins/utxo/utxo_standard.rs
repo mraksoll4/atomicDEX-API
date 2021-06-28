@@ -435,7 +435,7 @@ impl MarketCoinOps for UtxoStandardCoin {
     }
 
     fn address_from_pubkey_str(&self, pubkey: &str) -> Result<String, String> {
-        utxo_common::address_from_pubkey_str(self, pubkey)
+        utxo_common::display_address_from_pubkey_str(self, pubkey)
     }
 
     fn display_priv_key(&self) -> String { utxo_common::display_priv_key(&self.utxo_arc) }

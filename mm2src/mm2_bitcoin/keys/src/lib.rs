@@ -22,7 +22,7 @@ mod signature;
 pub use primitives::{bytes, hash};
 
 pub use address::{Address, Type};
-pub use cashaddress::{AddressType as CashAddrType, CashAddress};
+pub use cashaddress::{AddressType as CashAddrType, CashAddress, NetworkPrefix};
 pub use display::DisplayLayout;
 pub use error::Error;
 pub use keypair::KeyPair;
