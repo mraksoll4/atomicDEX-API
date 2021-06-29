@@ -45,6 +45,7 @@ use futures::lock::{MappedMutexGuard as AsyncMappedMutexGuard, Mutex as AsyncMut
 use futures::{FutureExt, TryFutureExt};
 use futures01::Future;
 use http::{Response, StatusCode};
+use keys::NetworkPrefix as CashAddrPrefix;
 use rpc::v1::types::{Bytes as BytesJson, H256 as H256Json};
 use serde::{Deserialize, Deserializer};
 use serde_json::{self as json, Value as Json};
@@ -53,6 +54,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 // using custom copy of try_fus as futures crate was renamed to futures01
@@ -101,6 +103,8 @@ use tx_history_db::{TxHistoryDb, TxHistoryError, TxHistoryOps, TxHistoryResult};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
 pub mod z_coin;
+use crate::utxo::bch::{bch_coin_from_conf_and_request, BchCoin};
+use crate::utxo::slp::{slp_addr_from_pubkey_str, SlpFeeDetails};
 #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
 use z_coin::{z_coin_from_conf_and_request, ZCoin};
 
@@ -393,6 +397,7 @@ pub enum TxFeeDetails {
     Utxo(UtxoFeeDetails),
     Eth(EthTxFeeDetails),
     Qrc20(Qrc20FeeDetails),
+    Slp(SlpFeeDetails),
 }
 
 /// Deserialize the TxFeeDetails as an untagged enum.
@@ -867,6 +872,7 @@ pub enum MmCoinEnum {
     EthCoin(EthCoin),
     #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
     ZCoin(ZCoin),
+    Bch(BchCoin),
     SlpToken(SlpToken),
     Test(TestCoin),
 }
@@ -891,6 +897,10 @@ impl From<Qrc20Coin> for MmCoinEnum {
     fn from(c: Qrc20Coin) -> MmCoinEnum { MmCoinEnum::Qrc20Coin(c) }
 }
 
+impl From<BchCoin> for MmCoinEnum {
+    fn from(c: BchCoin) -> MmCoinEnum { MmCoinEnum::Bch(c) }
+}
+
 impl From<SlpToken> for MmCoinEnum {
     fn from(c: SlpToken) -> MmCoinEnum { MmCoinEnum::SlpToken(c) }
 }
@@ -909,6 +919,7 @@ impl Deref for MmCoinEnum {
             MmCoinEnum::QtumCoin(ref c) => c,
             MmCoinEnum::Qrc20Coin(ref c) => c,
             MmCoinEnum::EthCoin(ref c) => c,
+            MmCoinEnum::Bch(ref c) => c,
             MmCoinEnum::SlpToken(ref c) => c,
             #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
             MmCoinEnum::ZCoin(ref c) => c,
@@ -969,7 +980,7 @@ impl CoinsContext {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", content = "protocol_data")]
 pub enum CoinProtocol {
     UTXO,
@@ -988,7 +999,9 @@ pub enum CoinProtocol {
         token_id: H256Json,
         decimals: u8,
         required_confirmations: Option<u64>,
-        address_prefix: String,
+    },
+    Bch {
+        slp_prefix: String,
     },
     #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
     ZHTLC,
@@ -1197,30 +1210,26 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
             )
             .into()
         },
+        CoinProtocol::Bch { slp_prefix } => {
+            let prefix = try_s!(CashAddrPrefix::from_str(&slp_prefix));
+            let bch = try_s!(bch_coin_from_conf_and_request(ctx, ticker, &coins_en, req, prefix, secret).await);
+            bch.into()
+        },
         CoinProtocol::SlpToken {
             platform,
             token_id,
             decimals,
             required_confirmations,
-            address_prefix,
         } => {
             let platform_coin = try_s!(lp_coinfind(ctx, &platform).await);
-            let platform_utxo = match platform_coin {
-                Some(MmCoinEnum::UtxoCoin(coin)) => coin.clone(),
-                Some(_) => return ERR!("Platform coin {} is not UtxoCoin", platform),
+            let platform_coin = match platform_coin {
+                Some(MmCoinEnum::Bch(coin)) => coin,
+                Some(_) => return ERR!("Platform coin {} is not BCH", platform),
                 None => return ERR!("Platform coin {} is not activated", platform),
             };
 
-            let prefix = try_s!(address_prefix.parse());
-            let confs = required_confirmations.unwrap_or(platform_utxo.required_confirmations());
-            let token = SlpToken::new(
-                *decimals,
-                ticker.into(),
-                token_id.clone().into(),
-                platform_utxo,
-                confs,
-                prefix,
-            );
+            let confs = required_confirmations.unwrap_or(platform_coin.required_confirmations());
+            let token = SlpToken::new(*decimals, ticker.into(), token_id.clone().into(), platform_coin, confs);
             token.into()
         },
         #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
@@ -1671,16 +1680,33 @@ pub async fn convert_utxo_address(ctx: MmArc, req: Json) -> Result<Response<Vec<
     Ok(try_s!(Response::builder().body(response)))
 }
 
-pub fn address_by_coin_conf_and_pubkey_str(coin: &str, conf: &Json, pubkey: &str) -> Result<String, String> {
+pub fn address_by_coin_conf_and_pubkey_str(
+    ctx: &MmArc,
+    coin: &str,
+    conf: &Json,
+    pubkey: &str,
+) -> Result<String, String> {
     let protocol: CoinProtocol = try_s!(json::from_value(conf["protocol"].clone()));
     match protocol {
         CoinProtocol::ERC20 { .. } | CoinProtocol::ETH => eth::addr_from_pubkey_str(pubkey),
-        CoinProtocol::UTXO | CoinProtocol::QTUM | CoinProtocol::QRC20 { .. } => {
+        CoinProtocol::UTXO | CoinProtocol::QTUM | CoinProtocol::QRC20 { .. } | CoinProtocol::Bch { .. } => {
             utxo::address_by_conf_and_pubkey_str(coin, conf, pubkey)
+        },
+        CoinProtocol::SlpToken { platform, .. } => {
+            let platform_conf = coin_conf(&ctx, &platform);
+            if platform_conf.is_null() {
+                return ERR!("platform {} conf is null", platform);
+            }
+            // TODO is there any way to make it better without duplicating the prefix in the SLP conf?
+            let platform_protocol: CoinProtocol = try_s!(json::from_value(platform_conf["protocol"].clone()));
+            match platform_protocol {
+                CoinProtocol::Bch { slp_prefix } => {
+                    slp_addr_from_pubkey_str(pubkey, &slp_prefix).map_err(|e| ERRL!("{}", e))
+                },
+                _ => ERR!("Platform protocol {:?} is not BCH", platform_protocol),
+            }
         },
         #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
         CoinProtocol::ZHTLC => utxo::address_by_conf_and_pubkey_str(coin, conf, pubkey),
-        // TODO return the slp prefixed cash address here
-        CoinProtocol::SlpToken { .. } => unimplemented!(),
     }
 }

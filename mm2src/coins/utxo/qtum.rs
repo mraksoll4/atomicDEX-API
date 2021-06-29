@@ -138,7 +138,8 @@ pub async fn qtum_coin_from_conf_and_request(
     req: &Json,
     priv_key: &[u8],
 ) -> Result<QtumCoin, String> {
-    let coin: QtumCoin = try_s!(utxo_common::utxo_arc_from_conf_and_request(ctx, ticker, conf, req, priv_key).await);
+    let coin: QtumCoin =
+        try_s!(utxo_common::utxo_arc_from_conf_and_request(ctx, ticker, conf, req, priv_key, QtumCoin::from).await);
     Ok(coin)
 }
 

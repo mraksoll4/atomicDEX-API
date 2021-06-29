@@ -1062,7 +1062,7 @@ async fn trade_base_rel_electrum(pairs: &[(&'static str, &'static str)]) {
         {"coin":"ETH","name":"ethereum","protocol":{"type":"ETH"}},
         {"coin":"ZOMBIE","asset":"ZOMBIE","fname":"ZOMBIE (TESTCOIN)","txversion":4,"overwintered":1,"mm2":1,"protocol":{"type":"ZHTLC"}},
         {"coin":"JST","name":"jst","protocol":{"type":"ERC20","protocol_data":{"platform":"ETH","contract_address":"0x2b294F029Fde858b2c62184e8390591755521d8E"}}},
-        {"coin":"tBCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},"required_confirmations":0,
+        {"coin":"tBCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"Bch","protocol_data":{"slp_prefix":"slptest"}},"required_confirmations":0,
          "address_format":{"format":"cashaddress","network":"bchtest"}},
         {"coin":"FUSD","protocol":{"type":"SlpToken","protocol_data":{"decimals":4,"token_id":"bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7",
          "platform":"tBCH","address_prefix":"slptest"}}}

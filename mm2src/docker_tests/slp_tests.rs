@@ -6,6 +6,7 @@ use coins::utxo::utxo_common::send_outputs_from_my_address;
 use keys::{KeyPair, Private};
 use script::Builder;
 
+/*
 #[test]
 fn mint_slp_token() {
     let (_ctx, coin, privkey) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
@@ -47,3 +48,4 @@ fn mint_slp_token() {
         .unwrap();
     println!("{}", hex::encode(tx.tx_hex()));
 }
+*/

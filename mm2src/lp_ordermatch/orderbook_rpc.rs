@@ -108,6 +108,7 @@ pub async fn orderbook_rpc(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, S
                 ))?;
 
                 let address = try_s!(address_by_coin_conf_and_pubkey_str(
+                    &ctx,
                     &req.base,
                     &base_coin_conf,
                     &ask.pubkey
@@ -132,6 +133,7 @@ pub async fn orderbook_rpc(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, S
                     uuid
                 ))?;
                 let address = try_s!(address_by_coin_conf_and_pubkey_str(
+                    &ctx,
                     &req.rel,
                     &rel_coin_conf,
                     &bid.pubkey

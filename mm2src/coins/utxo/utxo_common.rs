@@ -106,9 +106,10 @@ pub async fn utxo_arc_from_conf_and_request<T>(
     conf: &Json,
     req: &Json,
     priv_key: &[u8],
+    constructor: impl Fn(UtxoArc) -> T + Copy + Send + 'static,
 ) -> Result<T, String>
 where
-    T: From<UtxoArc> + AsRef<UtxoCoinFields> + UtxoCommonOps + Send + Sync + 'static,
+    T: AsRef<UtxoCoinFields> + UtxoCommonOps + Send + Sync + 'static,
 {
     let builder = UtxoArcBuilder::new(ctx, ticker, conf, req, priv_key);
     let utxo_arc = try_s!(builder.build().await);
@@ -116,16 +117,17 @@ where
     let merge_params: Option<UtxoMergeParams> = try_s!(json::from_value(req["utxo_merge_params"].clone()));
     if let Some(merge_params) = merge_params {
         let weak = utxo_arc.downgrade();
-        let merge_loop = merge_utxo_loop::<T>(
+        let merge_loop = merge_utxo_loop(
             weak,
             merge_params.merge_at,
             merge_params.check_every,
             merge_params.max_merge_at_once,
+            constructor,
         );
         info!("Starting UTXO merge loop for coin {}", ticker);
         spawn(merge_loop);
     }
-    Ok(T::from(utxo_arc))
+    Ok(constructor(utxo_arc))
 }
 
 fn ten_f64() -> f64 { 10. }
@@ -2814,15 +2816,20 @@ fn increase_by_percent(num: u64, percent: f64) -> u64 {
     num + (percent.round() as u64)
 }
 
-async fn merge_utxo_loop<T>(weak: UtxoWeak, merge_at: usize, check_every: f64, max_merge_at_once: usize)
-where
-    T: From<UtxoArc> + AsRef<UtxoCoinFields> + UtxoCommonOps,
+async fn merge_utxo_loop<T>(
+    weak: UtxoWeak,
+    merge_at: usize,
+    check_every: f64,
+    max_merge_at_once: usize,
+    constructor: impl Fn(UtxoArc) -> T,
+) where
+    T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
     loop {
         Timer::sleep(check_every).await;
 
         let coin = match weak.upgrade() {
-            Some(arc) => T::from(arc),
+            Some(arc) => constructor(arc),
             None => break,
         };
 

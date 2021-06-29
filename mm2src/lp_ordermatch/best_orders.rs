@@ -135,7 +135,7 @@ pub async fn best_orders_rpc(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>,
             }
             for order_w_proof in orders_w_proofs {
                 let order = order_w_proof.order;
-                let address = match address_by_coin_conf_and_pubkey_str(&coin, &coin_conf, &order.pubkey) {
+                let address = match address_by_coin_conf_and_pubkey_str(&ctx, &coin, &coin_conf, &order.pubkey) {
                     Ok(a) => a,
                     Err(e) => {
                         log::error!("Error {} getting coin {} address from pubkey {}", e, coin, order.pubkey);

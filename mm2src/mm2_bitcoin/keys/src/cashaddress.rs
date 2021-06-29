@@ -13,7 +13,7 @@ pub enum AddressType {
     P2SH,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NetworkPrefix {
     BitcoinCash,
     BchTest,
@@ -62,7 +62,7 @@ impl NetworkPrefix {
     /// The method converts self to string and returns a byte array with each element
     /// being the corresponding character's right-most 5 bits.
     /// Result additionally includes a null termination byte.
-    fn encode_to_ckecksum(&self) -> Vec<u8> {
+    fn encode_to_checksum(&self) -> Vec<u8> {
         // Grab the right most 5 bits of each char.
         let mut prefix: Vec<u8> = self.to_string().as_bytes().iter().map(|x| x & 0b11111).collect();
         prefix.push(0);
@@ -255,7 +255,7 @@ fn addr_type_from_version(version: u8) -> Result<AddressType, String> {
 // CalculateChecksum calculates a BCH checksum for a nibble-packed cashaddress
 // that properly includes the network prefix.
 fn calculate_checksum(prefix: &NetworkPrefix, payload: &[u8]) -> u64 {
-    let mut raw_data = prefix.encode_to_ckecksum();
+    let mut raw_data = prefix.encode_to_checksum();
     raw_data.extend(payload);
     poly_mod(&raw_data)
 }

@@ -4,42 +4,44 @@ use crate::{CanRefundHtlc, CoinBalance, NegotiateSwapContractAddrErr, SwapOps, T
 use common::mm_metrics::MetricsArc;
 use common::mm_number::MmNumber;
 use futures::{FutureExt, TryFutureExt};
+use keys::NetworkPrefix as CashAddrPrefix;
 use serialization::CoinVariant;
 
 #[derive(Clone, Debug)]
-pub struct UtxoStandardCoin {
+pub struct BchCoin {
     utxo_arc: UtxoArc,
+    slp_addr_prefix: CashAddrPrefix,
 }
 
-impl AsRef<UtxoCoinFields> for UtxoStandardCoin {
+impl BchCoin {
+    pub fn slp_prefix(&self) -> CashAddrPrefix { self.slp_addr_prefix }
+}
+
+impl AsRef<UtxoCoinFields> for BchCoin {
     fn as_ref(&self) -> &UtxoCoinFields { &self.utxo_arc }
 }
 
-impl From<UtxoArc> for UtxoStandardCoin {
-    fn from(coin: UtxoArc) -> UtxoStandardCoin { UtxoStandardCoin { utxo_arc: coin } }
-}
-
-impl From<UtxoStandardCoin> for UtxoArc {
-    fn from(coin: UtxoStandardCoin) -> Self { coin.utxo_arc }
-}
-
-pub async fn utxo_standard_coin_from_conf_and_request(
+pub async fn bch_coin_from_conf_and_request(
     ctx: &MmArc,
     ticker: &str,
     conf: &Json,
     req: &Json,
+    slp_addr_prefix: CashAddrPrefix,
     priv_key: &[u8],
-) -> Result<UtxoStandardCoin, String> {
-    let coin: UtxoStandardCoin = try_s!(
-        utxo_common::utxo_arc_from_conf_and_request(ctx, ticker, conf, req, priv_key, UtxoStandardCoin::from).await
-    );
+) -> Result<BchCoin, String> {
+    let constructor = move |utxo_arc| BchCoin {
+        utxo_arc,
+        slp_addr_prefix,
+    };
+    let coin: BchCoin =
+        try_s!(utxo_common::utxo_arc_from_conf_and_request(ctx, ticker, conf, req, priv_key, constructor).await);
     Ok(coin)
 }
 
 // if mockable is placed before async_trait there is `munmap_chunk(): invalid pointer` error on async fn mocking attempt
 #[async_trait]
 #[cfg_attr(test, mockable)]
-impl UtxoCommonOps for UtxoStandardCoin {
+impl UtxoCommonOps for BchCoin {
     async fn get_tx_fee(&self) -> Result<ActualTxFee, JsonRpcError> { utxo_common::get_tx_fee(&self.utxo_arc).await }
 
     async fn get_htlc_spend_fee(&self) -> UtxoRpcResult<u64> { utxo_common::get_htlc_spend_fee(self).await }
@@ -167,30 +169,7 @@ impl UtxoCommonOps for UtxoStandardCoin {
     }
 }
 
-#[async_trait]
-impl UtxoStandardOps for UtxoStandardCoin {
-    async fn tx_details_by_hash(
-        &self,
-        hash: &[u8],
-        input_transactions: &mut HistoryUtxoTxMap,
-    ) -> Result<TransactionDetails, String> {
-        utxo_common::tx_details_by_hash(self, hash, input_transactions).await
-    }
-
-    async fn request_tx_history(&self, metrics: MetricsArc) -> RequestTxHistoryResult {
-        utxo_common::request_tx_history(self, metrics).await
-    }
-
-    async fn update_kmd_rewards(
-        &self,
-        tx_details: &mut TransactionDetails,
-        input_transactions: &mut HistoryUtxoTxMap,
-    ) -> UtxoRpcResult<()> {
-        utxo_common::update_kmd_rewards(self, tx_details, input_transactions).await
-    }
-}
-
-impl SwapOps for UtxoStandardCoin {
+impl SwapOps for BchCoin {
     fn send_taker_fee(&self, fee_addr: &[u8], amount: BigDecimal) -> TransactionFut {
         utxo_common::send_taker_fee(self.clone(), fee_addr, amount)
     }
@@ -380,7 +359,7 @@ impl SwapOps for UtxoStandardCoin {
     }
 }
 
-impl MarketCoinOps for UtxoStandardCoin {
+impl MarketCoinOps for BchCoin {
     fn ticker(&self) -> &str { &self.utxo_arc.conf.ticker }
 
     fn my_address(&self) -> Result<String, String> { utxo_common::my_address(self) }
@@ -446,7 +425,30 @@ impl MarketCoinOps for UtxoStandardCoin {
     fn min_trading_vol(&self) -> MmNumber { utxo_common::min_trading_vol(self.as_ref()) }
 }
 
-impl MmCoin for UtxoStandardCoin {
+#[async_trait]
+impl UtxoStandardOps for BchCoin {
+    async fn tx_details_by_hash(
+        &self,
+        hash: &[u8],
+        input_transactions: &mut HistoryUtxoTxMap,
+    ) -> Result<TransactionDetails, String> {
+        utxo_common::tx_details_by_hash(self, hash, input_transactions).await
+    }
+
+    async fn request_tx_history(&self, metrics: MetricsArc) -> RequestTxHistoryResult {
+        utxo_common::request_tx_history(self, metrics).await
+    }
+
+    async fn update_kmd_rewards(
+        &self,
+        tx_details: &mut TransactionDetails,
+        input_transactions: &mut HistoryUtxoTxMap,
+    ) -> UtxoRpcResult<()> {
+        utxo_common::update_kmd_rewards(self, tx_details, input_transactions).await
+    }
+}
+
+impl MmCoin for BchCoin {
     fn is_asset_chain(&self) -> bool { utxo_common::is_asset_chain(&self.utxo_arc) }
 
     fn withdraw(&self, req: WithdrawRequest) -> WithdrawFut {
