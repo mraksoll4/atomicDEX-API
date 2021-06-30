@@ -191,21 +191,20 @@ impl SlpToken {
         ),
         MmError<SlpUnspentsErr>,
     > {
-        let (unspents, recently_spent) = self
-            .platform_coin
-            .list_unspent_ordered(&self.platform_coin.as_ref().my_address)
-            .await?;
+        let (unspents, recently_spent) =
+            utxo_common::list_unspent_ordered(&self.platform_coin, &self.platform_coin.as_ref().my_address).await?;
 
         let mut slp_unspents = vec![];
         let mut bch_unspents = vec![];
 
         for unspent in unspents {
             let prev_tx_bytes = self
-                .rpc()
-                .get_transaction_bytes(unspent.outpoint.hash.reversed().into())
+                .platform_coin
+                .get_verbose_transaction_from_cache_or_rpc(unspent.outpoint.hash.reversed().into())
                 .compat()
-                .await?;
-            let prev_tx: UtxoTx = deserialize(prev_tx_bytes.0.as_slice())?;
+                .await?
+                .into_inner();
+            let prev_tx: UtxoTx = deserialize(prev_tx_bytes.hex.as_slice())?;
             match parse_slp_script(&prev_tx.outputs[0].script_pubkey) {
                 Ok(slp_data) => match slp_data.transaction {
                     SlpTransaction::Send { token_id, amounts } => {
@@ -689,7 +688,7 @@ impl SlpToken {
 
 /// https://slp.dev/specs/slp-token-type-1/#transaction-detail
 #[derive(Debug, Eq, PartialEq)]
-enum SlpTransaction {
+pub enum SlpTransaction {
     /// https://slp.dev/specs/slp-token-type-1/#genesis-token-genesis-transaction
     Genesis {
         token_ticker: String,
@@ -697,13 +696,13 @@ enum SlpTransaction {
         token_document_url: String,
         token_document_hash: Vec<u8>,
         decimals: Vec<u8>,
-        mint_baton_vout: Vec<u8>,
+        mint_baton_vout: Option<u8>,
         initial_token_mint_quantity: Vec<u8>,
     },
     /// https://slp.dev/specs/slp-token-type-1/#mint-extended-minting-transaction
     Mint {
         token_id: H256,
-        mint_baton_vout: Vec<u8>,
+        mint_baton_vout: Option<u8>,
         additional_token_quantity: Vec<u8>,
     },
     /// https://slp.dev/specs/slp-token-type-1/#send-spend-transaction
@@ -741,11 +740,10 @@ impl Deserializable for SlpTransaction {
                 let decimals = reader.read_list()?;
                 let maybe_push_op_code: u8 = reader.read()?;
                 let mint_baton_vout = if maybe_push_op_code == Opcode::OP_PUSHDATA1 as u8 {
-                    reader.read_list()?
+                    let _zero: u8 = reader.read()?;
+                    None
                 } else {
-                    let mut baton = vec![0; maybe_push_op_code as usize];
-                    reader.read_slice(&mut baton)?;
-                    baton
+                    Some(reader.read()?)
                 };
                 let initial_token_mint_quantity = reader.read_list()?;
 
@@ -765,9 +763,17 @@ impl Deserializable for SlpTransaction {
                     return Err(Error::Custom(format!("Unexpected token id length {}", maybe_id.len())));
                 }
 
+                let maybe_push_op_code: u8 = reader.read()?;
+                let mint_baton_vout = if maybe_push_op_code == Opcode::OP_PUSHDATA1 as u8 {
+                    let _zero: u8 = reader.read()?;
+                    None
+                } else {
+                    Some(reader.read()?)
+                };
+
                 Ok(SlpTransaction::Mint {
                     token_id: H256::from(maybe_id.as_slice()),
-                    mint_baton_vout: reader.read_list()?,
+                    mint_baton_vout,
                     additional_token_quantity: reader.read_list()?,
                 })
             },
@@ -799,16 +805,17 @@ impl Deserializable for SlpTransaction {
 }
 
 #[derive(Debug, Deserializable)]
-struct SlpTxDetails {
+pub struct SlpTxDetails {
     op_code: u8,
     lokad_id: String,
     token_type: String,
-    transaction: SlpTransaction,
+    pub transaction: SlpTransaction,
 }
 
-#[derive(Debug)]
-enum ParseSlpScriptError {
+#[derive(Debug, Display)]
+pub enum ParseSlpScriptError {
     NotOpReturn,
+    #[display(fmt = "DeserializeFailed: {:?}", _0)]
     DeserializeFailed(Error),
 }
 
@@ -816,7 +823,7 @@ impl From<Error> for ParseSlpScriptError {
     fn from(err: Error) -> ParseSlpScriptError { ParseSlpScriptError::DeserializeFailed(err) }
 }
 
-fn parse_slp_script(script: &[u8]) -> Result<SlpTxDetails, MmError<ParseSlpScriptError>> {
+pub fn parse_slp_script(script: &[u8]) -> Result<SlpTxDetails, MmError<ParseSlpScriptError>> {
     let details: SlpTxDetails = deserialize(script).map_to_mm(ParseSlpScriptError::from)?;
     if Opcode::from_u8(details.op_code) != Some(Opcode::OP_RETURN) {
         return MmError::err(ParseSlpScriptError::NotOpReturn);
@@ -1569,10 +1576,8 @@ pub fn slp_addr_from_pubkey_str(pubkey: &str, prefix: &str) -> Result<String, Mm
 #[cfg(test)]
 mod slp_tests {
     use super::*;
-    use crate::utxo::bch::bch_coin_from_conf_and_request;
-    use common::mm_ctx::MmCtxBuilder;
-    use common::privkey::key_pair_from_seed;
-    use common::{block_on, now_ms};
+    use crate::utxo::bch::tbch_coin_for_test;
+    use common::now_ms;
 
     // https://slp.dev/specs/slp-token-type-1/#examples
     #[test]
@@ -1602,7 +1607,7 @@ mod slp_tests {
             token_document_url: "".to_string(),
             token_document_hash: vec![],
             decimals: vec![8],
-            mint_baton_vout: vec![],
+            mint_baton_vout: None,
             initial_token_mint_quantity,
         };
 
@@ -1621,7 +1626,7 @@ mod slp_tests {
             token_document_hash: hex::decode("db4451f11eda33950670aaf59e704da90117ff7057283b032cfaec7779313916")
                 .unwrap(),
             decimals: vec![8],
-            mint_baton_vout: vec![2],
+            mint_baton_vout: Some(2),
             initial_token_mint_quantity,
         };
 
@@ -1634,7 +1639,7 @@ mod slp_tests {
         assert_eq!(slp_data.lokad_id, "SLP\0");
         let expected_transaction = SlpTransaction::Mint {
             token_id: "550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35".into(),
-            mint_baton_vout: vec![2],
+            mint_baton_vout: Some(2),
             additional_token_quantity: hex::decode("002386f26fc10000").unwrap(),
         };
 
@@ -1655,25 +1660,7 @@ mod slp_tests {
     #[test]
     #[ignore]
     fn send_and_spend_htlc_on_testnet() {
-        let ctx = MmCtxBuilder::default().into_mm_arc();
-        let keypair = key_pair_from_seed("BCH SLP test").unwrap();
-
-        let conf = json!({"coin":"BCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},
-         "address_format":{"format":"cashaddress","network":"bchtest"}});
-        let req = json!({
-            "method": "electrum",
-            "coin": "BCH",
-            "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"}],
-        });
-        let bch = block_on(bch_coin_from_conf_and_request(
-            &ctx,
-            "BCH",
-            &conf,
-            &req,
-            CashAddrPrefix::SlpTest,
-            &*keypair.private().secret,
-        ))
-        .unwrap();
+        let bch = tbch_coin_for_test();
 
         let balance = bch.my_balance().wait().unwrap();
         println!("{}", balance.spendable);
@@ -1691,6 +1678,8 @@ mod slp_tests {
         let secret_hash = dhash160(&secret);
         let time_lock = (now_ms() / 1000) as u32;
         let amount: BigDecimal = "0.1".parse().unwrap();
+
+        let keypair = &fusd.platform_coin.as_ref().key_pair;
 
         let tx = fusd
             .send_taker_payment(time_lock, &*keypair.public(), &*secret_hash, amount.clone(), &None)
@@ -1730,25 +1719,7 @@ mod slp_tests {
     #[test]
     #[ignore]
     fn send_and_refund_htlc_on_testnet() {
-        let ctx = MmCtxBuilder::default().into_mm_arc();
-        let keypair = key_pair_from_seed("BCH SLP test").unwrap();
-
-        let conf = json!({"coin":"BCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},
-         "address_format":{"format":"cashaddress","network":"bchtest"}});
-        let req = json!({
-            "method": "electrum",
-            "coin": "BCH",
-            "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"}],
-        });
-        let bch = block_on(bch_coin_from_conf_and_request(
-            &ctx,
-            "BCH",
-            &conf,
-            &req,
-            CashAddrPrefix::SlpTest,
-            &*keypair.private().secret,
-        ))
-        .unwrap();
+        let bch = tbch_coin_for_test();
 
         let balance = bch.my_balance().wait().unwrap();
         println!("{}", balance.spendable);
@@ -1782,37 +1753,9 @@ mod slp_tests {
 
     #[test]
     fn test_slp_address() {
-        let ctx = MmCtxBuilder::default().into_mm_arc();
-        let keypair = key_pair_from_seed("BCH SLP test").unwrap();
-
-        let conf = json!({"coin":"BCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},
-         "address_format":{"format":"cashaddress","network":"bchtest"}});
-        let req = json!({
-            "method": "electrum",
-            "coin": "BCH",
-            "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"},{"url":"tbch.loping.net:60001"}],
-        });
-        let bch = block_on(bch_coin_from_conf_and_request(
-            &ctx,
-            "BCH",
-            &conf,
-            &req,
-            CashAddrPrefix::SlpTest,
-            &*keypair.private().secret,
-        ))
-        .unwrap();
-
-        let balance = bch.my_balance().wait().unwrap();
-        println!("{}", balance.spendable);
-
-        let address = bch.my_address().unwrap();
-        println!("{}", address);
-
+        let bch = tbch_coin_for_test();
         let token_id = H256::from("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7");
         let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0);
-
-        let fusd_balance = fusd.my_balance().wait().unwrap();
-        println!("FUSD {}", fusd_balance.spendable);
 
         let slp_address = fusd.my_address().unwrap();
         assert_eq!("slptest:qzx0llpyp8gxxsmad25twksqnwd62xm3lsg8lecug8", slp_address);

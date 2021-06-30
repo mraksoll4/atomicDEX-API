@@ -3,7 +3,7 @@ use crate::qrc20::rpc_clients::{LogEntry, Qrc20ElectrumOps, Qrc20NativeOps, Qrc2
                                 ViewContractCallType};
 use crate::utxo::qtum::QtumBasedCoin;
 use crate::utxo::rpc_clients::{ElectrumClient, NativeClient, UnspentInfo, UtxoRpcClientEnum, UtxoRpcClientOps,
-                               UtxoRpcError, UtxoRpcResult};
+                               UtxoRpcError, UtxoRpcFut, UtxoRpcResult};
 use crate::utxo::utxo_common::{self, big_decimal_from_sat, check_all_inputs_signed_by_pub};
 use crate::utxo::{qtum, sign_tx, ActualTxFee, AdditionalTxData, FeePolicy, GenerateTxError, GenerateTxResult,
                   HistoryUtxoTx, HistoryUtxoTxMap, RecentlySpentOutPoints, UtxoCoinBuilder, UtxoCoinFields,
@@ -553,10 +553,7 @@ impl UtxoCommonOps for Qrc20Coin {
         utxo_common::ordered_mature_unspents(self, address).await
     }
 
-    fn get_verbose_transaction_from_cache_or_rpc(
-        &self,
-        txid: H256Json,
-    ) -> Box<dyn Future<Item = VerboseTransactionFrom, Error = String> + Send> {
+    fn get_verbose_transaction_from_cache_or_rpc(&self, txid: H256Json) -> UtxoRpcFut<VerboseTransactionFrom> {
         let selfi = self.clone();
         let fut = async move { utxo_common::get_verbose_transaction_from_cache_or_rpc(&selfi.utxo, txid).await };
         Box::new(fut.boxed().compat())

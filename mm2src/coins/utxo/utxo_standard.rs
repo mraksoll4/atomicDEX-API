@@ -128,10 +128,7 @@ impl UtxoCommonOps for UtxoStandardCoin {
         utxo_common::ordered_mature_unspents(self, address).await
     }
 
-    fn get_verbose_transaction_from_cache_or_rpc(
-        &self,
-        txid: H256Json,
-    ) -> Box<dyn Future<Item = VerboseTransactionFrom, Error = String> + Send> {
+    fn get_verbose_transaction_from_cache_or_rpc(&self, txid: H256Json) -> UtxoRpcFut<VerboseTransactionFrom> {
         let selfi = self.clone();
         let fut = async move { utxo_common::get_verbose_transaction_from_cache_or_rpc(&selfi.utxo_arc, txid).await };
         Box::new(fut.boxed().compat())

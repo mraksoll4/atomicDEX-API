@@ -1,11 +1,14 @@
 use super::*;
+use crate::utxo::rpc_clients::UtxoRpcFut;
+use crate::utxo::slp::{parse_slp_script, SlpTransaction};
 use crate::{CanRefundHtlc, CoinBalance, NegotiateSwapContractAddrErr, SwapOps, TradePreimageValue,
             ValidateAddressResult, WithdrawFut};
+use common::log::warn;
 use common::mm_metrics::MetricsArc;
 use common::mm_number::MmNumber;
 use futures::{FutureExt, TryFutureExt};
 use keys::NetworkPrefix as CashAddrPrefix;
-use serialization::CoinVariant;
+use serialization::{deserialize, CoinVariant};
 
 #[derive(Clone, Debug)]
 pub struct BchCoin {
@@ -13,8 +16,68 @@ pub struct BchCoin {
     slp_addr_prefix: CashAddrPrefix,
 }
 
+pub enum IsSlpUtxoError {
+    Rpc(UtxoRpcError),
+    TxDeserialization(serialization::Error),
+}
+
+impl From<UtxoRpcError> for IsSlpUtxoError {
+    fn from(err: UtxoRpcError) -> IsSlpUtxoError { IsSlpUtxoError::Rpc(err) }
+}
+
+impl From<serialization::Error> for IsSlpUtxoError {
+    fn from(err: serialization::Error) -> IsSlpUtxoError { IsSlpUtxoError::TxDeserialization(err) }
+}
+
 impl BchCoin {
     pub fn slp_prefix(&self) -> CashAddrPrefix { self.slp_addr_prefix }
+
+    async fn should_skip_utxo(&self, utxo: &UnspentInfo) -> Result<bool, MmError<UtxoRpcError>> {
+        // zero output is reserved for OP_RETURN in the SLP protocol so it can be used right away
+        if utxo.outpoint.index == 0 {
+            return Ok(false);
+        }
+
+        let previous_tx = self
+            .get_verbose_transaction_from_cache_or_rpc(utxo.outpoint.hash.reversed().into())
+            .compat()
+            .await?
+            .into_inner();
+
+        let prev_tx: UtxoTx = deserialize(previous_tx.hex.as_slice())?;
+        if prev_tx.outputs.is_empty() {
+            return Ok(false);
+        }
+
+        match parse_slp_script(&prev_tx.outputs[0].script_pubkey) {
+            Ok(slp_details) => match slp_details.transaction {
+                SlpTransaction::Send { amounts, .. } => Ok(utxo.outpoint.index <= amounts.len() as u32),
+                SlpTransaction::Genesis { mint_baton_vout, .. } => {
+                    let is_genesis = utxo.outpoint.index == 1;
+                    let is_baton = Some(utxo.outpoint.index) == mint_baton_vout.map(|baton| baton as u32);
+                    Ok(is_genesis || is_baton)
+                },
+                SlpTransaction::Mint { mint_baton_vout, .. } => {
+                    let is_mint = utxo.outpoint.index == 1;
+                    let is_baton = Some(utxo.outpoint.index) == mint_baton_vout.map(|baton| baton as u32);
+                    Ok(is_mint || is_baton)
+                },
+            },
+            Err(e) => {
+                let script: Script = prev_tx.outputs[0].script_pubkey.clone().into();
+                let should_skip = !(script.is_pay_to_public_key_hash()
+                    || script.is_pay_to_public_key()
+                    || script.is_pay_to_script_hash());
+                if should_skip {
+                    warn!(
+                        "Skipping UTXO {:?}, failed to parse script as SLP ({}) and script is not standard",
+                        utxo, e
+                    );
+                }
+                Ok(should_skip)
+            },
+        }
+    }
 }
 
 impl AsRef<UtxoCoinFields> for BchCoin {
@@ -127,13 +190,10 @@ impl UtxoCommonOps for BchCoin {
         &'a self,
         address: &Address,
     ) -> UtxoRpcResult<(Vec<UnspentInfo>, AsyncMutexGuard<'a, RecentlySpentOutPoints>)> {
-        utxo_common::ordered_mature_unspents(self, address).await
+        self.list_unspent_ordered(address).await
     }
 
-    fn get_verbose_transaction_from_cache_or_rpc(
-        &self,
-        txid: H256Json,
-    ) -> Box<dyn Future<Item = VerboseTransactionFrom, Error = String> + Send> {
+    fn get_verbose_transaction_from_cache_or_rpc(&self, txid: H256Json) -> UtxoRpcFut<VerboseTransactionFrom> {
         let selfi = self.clone();
         let fut = async move { utxo_common::get_verbose_transaction_from_cache_or_rpc(&selfi.utxo_arc, txid).await };
         Box::new(fut.boxed().compat())
@@ -147,7 +207,14 @@ impl UtxoCommonOps for BchCoin {
         &'a self,
         address: &Address,
     ) -> UtxoRpcResult<(Vec<UnspentInfo>, AsyncMutexGuard<'a, RecentlySpentOutPoints>)> {
-        utxo_common::list_unspent_ordered(self, address).await
+        let (all_unspents, recently_spent) = utxo_common::list_unspent_ordered(self, address).await?;
+        let mut filtered_unspents = Vec::with_capacity(all_unspents.len());
+        for unspent in all_unspents {
+            if !self.should_skip_utxo(&unspent).await? {
+                filtered_unspents.push(unspent);
+            }
+        }
+        Ok((filtered_unspents, recently_spent))
     }
 
     async fn preimage_trade_fee_required_to_send_outputs(
@@ -509,4 +576,203 @@ impl MmCoin for BchCoin {
     fn swap_contract_address(&self) -> Option<BytesJson> { utxo_common::swap_contract_address() }
 
     fn mature_confirmations(&self) -> Option<u32> { Some(self.utxo_arc.conf.mature_confirmations) }
+}
+
+// testnet
+#[cfg(test)]
+pub fn tbch_coin_for_test() -> BchCoin {
+    use common::block_on;
+    use common::mm_ctx::MmCtxBuilder;
+    use common::privkey::key_pair_from_seed;
+
+    let ctx = MmCtxBuilder::default().into_mm_arc();
+    let keypair = key_pair_from_seed("BCH SLP test").unwrap();
+
+    let conf = json!({"coin":"BCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},
+         "address_format":{"format":"cashaddress","network":"bchtest"}});
+    let req = json!({
+        "method": "electrum",
+        "coin": "BCH",
+        "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"},{"url":"tbch.loping.net:60001"}],
+    });
+    block_on(bch_coin_from_conf_and_request(
+        &ctx,
+        "BCH",
+        &conf,
+        &req,
+        CashAddrPrefix::SlpTest,
+        &*keypair.private().secret,
+    ))
+    .unwrap()
+}
+
+// mainnet
+#[cfg(test)]
+pub fn bch_coin_for_test() -> BchCoin {
+    use common::block_on;
+    use common::mm_ctx::MmCtxBuilder;
+    use common::privkey::key_pair_from_seed;
+
+    let ctx = MmCtxBuilder::default().into_mm_arc();
+    let keypair = key_pair_from_seed("BCH SLP test").unwrap();
+
+    let conf = json!({"coin":"BCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"UTXO"},
+         "address_format":{"format":"cashaddress","network":"bitcoincash"}});
+    let req = json!({
+        "method": "electrum",
+        "coin": "BCH",
+        "servers": [{"url":"electrum1.cipig.net:10055"},{"url":"electrum2.cipig.net:10055"},{"url":"electrum3.cipig.net:10055"}],
+    });
+    block_on(bch_coin_from_conf_and_request(
+        &ctx,
+        "BCH",
+        &conf,
+        &req,
+        CashAddrPrefix::SimpleLedger,
+        &*keypair.private().secret,
+    ))
+    .unwrap()
+}
+
+#[cfg(test)]
+mod bch_tests {
+    use super::{bch_coin_for_test, tbch_coin_for_test};
+    use crate::utxo::rpc_clients::UnspentInfo;
+    use chain::OutPoint;
+    use common::block_on;
+    use keys::hash::H256;
+
+    #[test]
+    fn test_is_slp_utxo() {
+        let tbch = tbch_coin_for_test();
+        let unspent_zero_index = UnspentInfo {
+            outpoint: OutPoint::default(),
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(tbch.should_skip_utxo(&unspent_zero_index)).unwrap();
+        assert!(!is_slp);
+
+        let unspent_is_slp = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("e935160bfb5b45007a0fc6f8fbe8da618f28df6573731f1ffb54d9560abb49b2"),
+                index: 1,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(tbch.should_skip_utxo(&unspent_is_slp)).unwrap();
+        assert!(is_slp);
+
+        let unspent_is_slp_change = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("e935160bfb5b45007a0fc6f8fbe8da618f28df6573731f1ffb54d9560abb49b2"),
+                index: 2,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(tbch.should_skip_utxo(&unspent_is_slp_change)).unwrap();
+        assert!(is_slp);
+
+        let unspent_is_bch_change = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("e935160bfb5b45007a0fc6f8fbe8da618f28df6573731f1ffb54d9560abb49b2"),
+                index: 3,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(tbch.should_skip_utxo(&unspent_is_bch_change)).unwrap();
+        assert!(!is_slp);
+
+        let fusd_genesis = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7"),
+                index: 1,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(tbch.should_skip_utxo(&fusd_genesis)).unwrap();
+        assert!(is_slp);
+
+        let bch_main = bch_coin_for_test();
+        let usdt_genesis = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35"),
+                index: 1,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(bch_main.should_skip_utxo(&usdt_genesis)).unwrap();
+        assert!(is_slp);
+
+        let usdt_baton = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35"),
+                index: 2,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(bch_main.should_skip_utxo(&usdt_baton)).unwrap();
+        assert!(is_slp);
+
+        let usdt_bch_change = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35"),
+                index: 3,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(bch_main.should_skip_utxo(&usdt_bch_change)).unwrap();
+        assert!(!is_slp);
+
+        let usdt_mint = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("b36b0c7485ad569b98cc9b9614dc68a5208495f22ec3b00effcf963b135a5215"),
+                index: 1,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(bch_main.should_skip_utxo(&usdt_mint)).unwrap();
+        assert!(is_slp);
+
+        let usdt_mint_baton = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("b36b0c7485ad569b98cc9b9614dc68a5208495f22ec3b00effcf963b135a5215"),
+                index: 2,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(bch_main.should_skip_utxo(&usdt_mint_baton)).unwrap();
+        assert!(is_slp);
+
+        let usdt_mint_bch_change = UnspentInfo {
+            outpoint: OutPoint {
+                hash: H256::from_reversed_str("b36b0c7485ad569b98cc9b9614dc68a5208495f22ec3b00effcf963b135a5215"),
+                index: 3,
+            },
+            value: 0,
+            height: None,
+        };
+
+        let is_slp = block_on(bch_main.should_skip_utxo(&usdt_mint_bch_change)).unwrap();
+        assert!(!is_slp);
+    }
 }

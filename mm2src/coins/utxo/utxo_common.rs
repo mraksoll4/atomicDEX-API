@@ -106,13 +106,14 @@ pub async fn utxo_arc_from_conf_and_request<T>(
     conf: &Json,
     req: &Json,
     priv_key: &[u8],
-    constructor: impl Fn(UtxoArc) -> T + Copy + Send + 'static,
+    constructor: impl Fn(UtxoArc) -> T + Send + 'static,
 ) -> Result<T, String>
 where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps + Send + Sync + 'static,
 {
     let builder = UtxoArcBuilder::new(ctx, ticker, conf, req, priv_key);
     let utxo_arc = try_s!(builder.build().await);
+    let coin = constructor(utxo_arc.clone());
 
     let merge_params: Option<UtxoMergeParams> = try_s!(json::from_value(req["utxo_merge_params"].clone()));
     if let Some(merge_params) = merge_params {
@@ -127,7 +128,7 @@ where
         info!("Starting UTXO merge loop for coin {}", ticker);
         spawn(merge_loop);
     }
-    Ok(constructor(utxo_arc))
+    Ok(coin)
 }
 
 fn ten_f64() -> f64 { 10. }
@@ -2363,12 +2364,12 @@ pub fn is_unspent_mature(mature_confirmations: u32, output: &RpcTransaction) -> 
 pub async fn get_verbose_transaction_from_cache_or_rpc(
     coin: &UtxoCoinFields,
     txid: H256Json,
-) -> Result<VerboseTransactionFrom, String> {
+) -> Result<VerboseTransactionFrom, MmError<UtxoRpcError>> {
     let tx_cache_path = match &coin.tx_cache_directory {
         Some(p) => p.clone(),
         _ => {
             // the coin doesn't support TX local cache, don't try to load from cache and don't cache it
-            let tx = try_s!(coin.rpc_client.get_verbose_transaction(txid.clone()).compat().await);
+            let tx = coin.rpc_client.get_verbose_transaction(txid.clone()).compat().await?;
             return Ok(VerboseTransactionFrom::Rpc(tx));
         },
     };
@@ -2380,7 +2381,7 @@ pub async fn get_verbose_transaction_from_cache_or_rpc(
         _ => (),
     }
 
-    let tx = try_s!(coin.rpc_client.get_verbose_transaction(txid).compat().await);
+    let tx = coin.rpc_client.get_verbose_transaction(txid).compat().await?;
     Ok(VerboseTransactionFrom::Rpc(tx))
 }
 

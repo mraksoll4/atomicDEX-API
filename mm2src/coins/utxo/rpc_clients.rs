@@ -232,7 +232,7 @@ pub trait UtxoRpcClientOps: fmt::Debug + Send + Sync + 'static {
 
     fn get_transaction_bytes(&self, txid: H256Json) -> UtxoRpcFut<BytesJson>;
 
-    fn get_verbose_transaction(&self, txid: H256Json) -> RpcRes<RpcTransaction>;
+    fn get_verbose_transaction(&self, txid: H256Json) -> UtxoRpcFut<RpcTransaction>;
 
     fn get_block_count(&self) -> UtxoRpcFut<u64>;
 
@@ -596,8 +596,8 @@ impl UtxoRpcClientOps for NativeClient {
         Box::new(self.get_raw_transaction_bytes(txid).map_to_mm_fut(UtxoRpcError::from))
     }
 
-    fn get_verbose_transaction(&self, txid: H256Json) -> RpcRes<RpcTransaction> {
-        self.get_raw_transaction_verbose(txid)
+    fn get_verbose_transaction(&self, txid: H256Json) -> UtxoRpcFut<RpcTransaction> {
+        Box::new(self.get_raw_transaction_verbose(txid).map_to_mm_fut(UtxoRpcError::from))
     }
 
     fn get_block_count(&self) -> UtxoRpcFut<u64> {
@@ -1519,9 +1519,9 @@ impl UtxoRpcClientOps for ElectrumClient {
 
     /// https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-get
     /// returns verbose transaction by default
-    fn get_verbose_transaction(&self, txid: H256Json) -> RpcRes<RpcTransaction> {
+    fn get_verbose_transaction(&self, txid: H256Json) -> UtxoRpcFut<RpcTransaction> {
         let verbose = true;
-        rpc_func!(self, "blockchain.transaction.get", txid, verbose)
+        Box::new(rpc_func!(self, "blockchain.transaction.get", txid, verbose).map_to_mm_fut(UtxoRpcError::from))
     }
 
     fn get_block_count(&self) -> UtxoRpcFut<u64> {

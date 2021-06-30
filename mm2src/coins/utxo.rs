@@ -79,6 +79,7 @@ use super::{BalanceError, BalanceFut, BalanceResult, CoinTransportMetrics, Coins
             NumConversResult, RpcClientType, RpcTransportEventHandler, RpcTransportEventHandlerShared, TradeFee,
             TradePreimageError, TradePreimageFut, TradePreimageResult, Transaction, TransactionDetails,
             TransactionEnum, TransactionFut, WithdrawError, WithdrawFee, WithdrawRequest};
+use crate::utxo::rpc_clients::UtxoRpcFut;
 
 #[cfg(test)] pub mod utxo_tests;
 #[cfg(target_arch = "wasm32")] pub mod utxo_wasm_tests;
@@ -579,10 +580,7 @@ pub trait UtxoCommonOps {
     ) -> UtxoRpcResult<(Vec<UnspentInfo>, AsyncMutexGuard<'a, RecentlySpentOutPoints>)>;
 
     /// Try to load verbose transaction from cache or try to request it from Rpc client.
-    fn get_verbose_transaction_from_cache_or_rpc(
-        &self,
-        txid: H256Json,
-    ) -> Box<dyn Future<Item = VerboseTransactionFrom, Error = String> + Send>;
+    fn get_verbose_transaction_from_cache_or_rpc(&self, txid: H256Json) -> UtxoRpcFut<VerboseTransactionFrom>;
 
     /// Cache transaction if the coin supports `TX_CACHE` and tx height is set and not zero.
     async fn cache_transaction_if_possible(&self, tx: &RpcTransaction) -> Result<(), String>;
@@ -735,6 +733,14 @@ pub enum RequestTxHistoryResult {
 pub enum VerboseTransactionFrom {
     Cache(RpcTransaction),
     Rpc(RpcTransaction),
+}
+
+impl VerboseTransactionFrom {
+    fn into_inner(self) -> RpcTransaction {
+        match self {
+            VerboseTransactionFrom::Rpc(tx) | VerboseTransactionFrom::Cache(tx) => tx,
+        }
+    }
 }
 
 pub fn compressed_key_pair_from_bytes(raw: &[u8], prefix: u8, checksum_type: ChecksumType) -> Result<KeyPair, String> {
