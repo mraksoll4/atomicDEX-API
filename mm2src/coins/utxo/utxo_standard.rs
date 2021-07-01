@@ -68,17 +68,6 @@ impl UtxoCommonOps for UtxoStandardCoin {
         utxo_common::is_unspent_mature(self.utxo_arc.conf.mature_confirmations, output)
     }
 
-    async fn generate_transaction(
-        &self,
-        utxos: Vec<UnspentInfo>,
-        outputs: Vec<TransactionOutput>,
-        fee_policy: FeePolicy,
-        fee: Option<ActualTxFee>,
-        gas_fee: Option<u64>,
-    ) -> GenerateTxResult {
-        utxo_common::generate_transaction(self, utxos, outputs, fee_policy, fee, gas_fee).await
-    }
-
     async fn calc_interest_if_required(
         &self,
         unsigned: TransactionInputSigner,

@@ -2,7 +2,7 @@ use super::p2pkh_spend;
 
 use crate::utxo::bch::BchCoin;
 use crate::utxo::rpc_clients::{UnspentInfo, UtxoRpcClientEnum, UtxoRpcError};
-use crate::utxo::utxo_common::{self, big_decimal_from_sat_unsigned, generate_transaction, p2sh_spend, payment_script};
+use crate::utxo::utxo_common::{self, big_decimal_from_sat_unsigned, p2sh_spend, payment_script, UtxoTxBuilder};
 use crate::utxo::{generate_and_send_tx, sat_from_big_decimal, sign_tx, ActualTxFee, FeePolicy, GenerateTxError,
                   RecentlySpentOutPoints, UtxoCoinConf, UtxoCommonOps, UtxoTx};
 use crate::{BalanceError, BalanceFut, CoinBalance, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps,
@@ -19,6 +19,7 @@ use common::mm_ctx::MmArc;
 use common::mm_error::prelude::*;
 use common::mm_number::{BigDecimal, MmNumber};
 use common::now_ms;
+use common::serde::export::Option::None;
 use derive_more::Display;
 use futures::compat::Future01CompatExt;
 use futures::lock::MutexGuard as AsyncMutexGuard;
@@ -69,7 +70,8 @@ struct SlpOutput {
 
 /// The SLP transaction preimage
 struct SlpTxPreimage<'a> {
-    inputs: Vec<UnspentInfo>,
+    slp_inputs: Vec<UnspentInfo>,
+    available_bch_inputs: Vec<UnspentInfo>,
     outputs: Vec<TransactionOutput>,
     recently_spent: AsyncMutexGuard<'a, RecentlySpentOutPoints>,
 }
@@ -285,8 +287,6 @@ impl SlpToken {
         }
         let change = total_slp_input - total_slp_output;
 
-        inputs.extend(bch_unspents);
-
         let mut amounts_for_op_return: Vec<_> = slp_outputs.iter().map(|spend_to| spend_to.amount).collect();
         if change > 0 {
             amounts_for_op_return.push(change);
@@ -319,7 +319,8 @@ impl SlpToken {
         }
 
         Ok(SlpTxPreimage {
-            inputs,
+            slp_inputs: inputs,
+            available_bch_inputs: bch_unspents,
             outputs,
             recently_spent,
         })
@@ -338,10 +339,11 @@ impl SlpToken {
         let preimage = try_s!(self.generate_slp_tx_preimage(vec![slp_out]).await);
         generate_and_send_tx(
             &self.platform_coin,
-            preimage.inputs,
-            preimage.outputs,
+            preimage.available_bch_inputs,
+            Some(preimage.slp_inputs),
             FeePolicy::SendExact,
             preimage.recently_spent,
+            preimage.outputs,
         )
         .await
     }
@@ -524,17 +526,13 @@ impl SlpToken {
         };
         outputs.push(slp_output);
 
-        let (_, mut bch_inputs, _recently_spent) = self.slp_unspents().await?;
-        bch_inputs.insert(0, p2sh_utxo.bch_unspent);
-        let (mut unsigned, _) = generate_transaction(
-            &self.platform_coin,
-            bch_inputs,
-            outputs,
-            FeePolicy::SendExact,
-            None,
-            None,
-        )
-        .await?;
+        let (_, bch_inputs, _recently_spent) = self.slp_unspents().await?;
+        let (mut unsigned, _) = UtxoTxBuilder::new(&self.platform_coin)
+            .add_required_inputs(std::iter::once(p2sh_utxo.bch_unspent))
+            .add_available_inputs(bch_inputs)
+            .add_outputs(outputs)
+            .build()
+            .await?;
 
         unsigned.lock_time = tx_locktime;
         unsigned.inputs[0].sequence = input_sequence;
@@ -990,10 +988,11 @@ impl SwapOps for SlpToken {
             let preimage = try_s!(coin.generate_slp_tx_preimage(vec![slp_out]).await);
             generate_and_send_tx(
                 &coin.platform_coin,
-                preimage.inputs,
-                preimage.outputs,
+                preimage.available_bch_inputs,
+                Some(preimage.slp_inputs),
                 FeePolicy::SendExact,
                 preimage.recently_spent,
+                preimage.outputs,
             )
             .await
         };
@@ -1310,26 +1309,6 @@ impl MmCoin for SlpToken {
                 )));
             }
 
-            let platform_decimals = coin.platform_decimals();
-            let fee = match req.fee {
-                Some(WithdrawFee::UtxoFixed { amount }) => {
-                    let fixed = sat_from_big_decimal(&amount, platform_decimals)?;
-                    Some(ActualTxFee::Fixed(fixed))
-                },
-                Some(WithdrawFee::UtxoPerKbyte { amount }) => {
-                    let dynamic = sat_from_big_decimal(&amount, platform_decimals)?;
-                    Some(ActualTxFee::Dynamic(dynamic))
-                },
-                Some(fee_policy) => {
-                    let error = format!(
-                        "Expected 'UtxoFixed' or 'UtxoPerKbyte' fee types, found {:?}",
-                        fee_policy
-                    );
-                    return MmError::err(WithdrawError::InvalidFeePolicy(error));
-                },
-                None => None,
-            };
-
             // TODO clarify with community whether we should support withdrawal to SLP P2SH addresses
             let script_pubkey = match address.address_type {
                 CashAddrType::P2PKH => ScriptBuilder::build_p2pkh(&address.hash.as_slice().into()).to_bytes(),
@@ -1341,23 +1320,34 @@ impl MmCoin for SlpToken {
             };
             let slp_output = SlpOutput { amount, script_pubkey };
             let slp_preimage = coin.generate_slp_tx_preimage(vec![slp_output]).await?;
-            let (unsigned, tx_data) = coin
-                .platform_coin
-                .generate_transaction(
-                    slp_preimage.inputs,
-                    slp_preimage.outputs,
-                    FeePolicy::SendExact,
-                    fee,
-                    None,
-                )
-                .await
-                .mm_err(|gen_tx_error| {
-                    WithdrawError::from_generate_tx_error(
-                        gen_tx_error,
-                        coin.platform_ticker().into(),
-                        platform_decimals,
-                    )
-                })?;
+            let mut tx_builder = UtxoTxBuilder::new(&coin.platform_coin)
+                .add_required_inputs(slp_preimage.slp_inputs)
+                .add_available_inputs(slp_preimage.available_bch_inputs)
+                .add_outputs(slp_preimage.outputs);
+
+            let platform_decimals = coin.platform_decimals();
+            match req.fee {
+                Some(WithdrawFee::UtxoFixed { amount }) => {
+                    let fixed = sat_from_big_decimal(&amount, platform_decimals)?;
+                    tx_builder = tx_builder.with_fee(ActualTxFee::Fixed(fixed))
+                },
+                Some(WithdrawFee::UtxoPerKbyte { amount }) => {
+                    let dynamic = sat_from_big_decimal(&amount, platform_decimals)?;
+                    tx_builder = tx_builder.with_fee(ActualTxFee::Dynamic(dynamic));
+                },
+                Some(fee_policy) => {
+                    let error = format!(
+                        "Expected 'UtxoFixed' or 'UtxoPerKbyte' fee types, found {:?}",
+                        fee_policy
+                    );
+                    return MmError::err(WithdrawError::InvalidFeePolicy(error));
+                },
+                None => (),
+            };
+
+            let (unsigned, tx_data) = tx_builder.build().await.mm_err(|gen_tx_error| {
+                WithdrawError::from_generate_tx_error(gen_tx_error, coin.platform_ticker().into(), platform_decimals)
+            })?;
 
             let prev_script = ScriptBuilder::build_p2pkh(&coin.platform_coin.as_ref().my_address.hash);
             let signed = sign_tx(

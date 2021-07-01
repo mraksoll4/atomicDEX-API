@@ -80,6 +80,7 @@ use super::{BalanceError, BalanceFut, BalanceResult, CoinTransportMetrics, Coins
             TradePreimageError, TradePreimageFut, TradePreimageResult, Transaction, TransactionDetails,
             TransactionEnum, TransactionFut, WithdrawError, WithdrawFee, WithdrawRequest};
 use crate::utxo::rpc_clients::UtxoRpcFut;
+use crate::utxo::utxo_common::UtxoTxBuilder;
 
 #[cfg(test)] pub mod utxo_tests;
 #[cfg(target_arch = "wasm32")] pub mod utxo_wasm_tests;
@@ -527,20 +528,6 @@ pub trait UtxoCommonOps {
 
     /// Check if the output is spendable (is not coinbase or it has enough confirmations).
     fn is_unspent_mature(&self, output: &RpcTransaction) -> bool;
-
-    /// Generates unsigned transaction (TransactionInputSigner) from specified utxos and outputs.
-    /// This function expects that utxos are sorted by amounts in ascending order
-    /// Consider sorting before calling this function
-    /// Sends the change (inputs amount - outputs amount) to "my_address"
-    /// Also returns additional transaction data
-    async fn generate_transaction(
-        &self,
-        utxos: Vec<UnspentInfo>,
-        outputs: Vec<TransactionOutput>,
-        fee_policy: FeePolicy,
-        fee: Option<ActualTxFee>,
-        gas_fee: Option<u64>,
-    ) -> GenerateTxResult;
 
     /// Calculates interest if the coin is KMD
     /// Adds the value to existing output to my_script_pub or creates additional interest output
@@ -1711,24 +1698,29 @@ where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
     let (unspents, recently_sent_txs) = try_s!(coin.list_unspent_ordered(&coin.as_ref().my_address).await);
-    generate_and_send_tx(&coin, unspents, outputs, FeePolicy::SendExact, recently_sent_txs).await
+    generate_and_send_tx(&coin, unspents, None, FeePolicy::SendExact, recently_sent_txs, outputs).await
 }
 
 /// Generates and sends tx using unspents and outputs adding new record to the recently_spent in case of success
 async fn generate_and_send_tx<T>(
     coin: &T,
     unspents: Vec<UnspentInfo>,
-    outputs: Vec<TransactionOutput>,
+    required_inputs: Option<Vec<UnspentInfo>>,
     fee_policy: FeePolicy,
     mut recently_spent: AsyncMutexGuard<'_, RecentlySpentOutPoints>,
+    outputs: Vec<TransactionOutput>,
 ) -> Result<UtxoTx, String>
 where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
-    let (unsigned, _) = try_s!(
-        coin.generate_transaction(unspents, outputs, fee_policy, None, None)
-            .await
-    );
+    let mut builder = UtxoTxBuilder::new(coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs)
+        .with_fee_policy(fee_policy);
+    if let Some(required) = required_inputs {
+        builder = builder.add_required_inputs(required);
+    }
+    let (unsigned, _) = try_s!(builder.build().await);
 
     let spent_unspents = unsigned
         .inputs

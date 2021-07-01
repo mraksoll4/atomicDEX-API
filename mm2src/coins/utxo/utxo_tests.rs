@@ -2,7 +2,7 @@ use super::rpc_clients::{ElectrumProtocol, ListSinceBlockRes, NetworkInfo};
 use super::*;
 use crate::utxo::qtum::{qtum_coin_from_conf_and_request, QtumCoin};
 use crate::utxo::rpc_clients::{GetAddressInfoRes, UtxoRpcClientOps, ValidateAddressRes, VerboseBlock};
-use crate::utxo::utxo_common::{generate_transaction, UtxoArcBuilder};
+use crate::utxo::utxo_common::{UtxoArcBuilder, UtxoTxBuilder};
 use crate::utxo::utxo_standard::{utxo_standard_coin_from_conf_and_request, UtxoStandardCoin};
 #[cfg(not(target_arch = "wasm32"))] use crate::WithdrawFee;
 use crate::{CoinBalance, SwapOps, TradePreimageValue, TxFeeDetails};
@@ -127,7 +127,11 @@ fn utxo_coin_for_test(rpc_client: UtxoRpcClientEnum, force_seed: Option<&str>) -
 
 #[test]
 fn test_extract_secret() {
-    let client = electrum_client_for_test(&["electrum1.cipig.net:10017"]);
+    let client = electrum_client_for_test(&[
+        "electrum1.cipig.net:10017",
+        "electrum2.cipig.net:10017",
+        "electrum3.cipig.net:10017",
+    ]);
     let coin = utxo_coin_for_test(client.into(), None);
 
     let tx_hex = hex::decode("0100000001de7aa8d29524906b2b54ee2e0281f3607f75662cbc9080df81d1047b78e21dbc00000000d7473044022079b6c50820040b1fbbe9251ced32ab334d33830f6f8d0bf0a40c7f1336b67d5b0220142ccf723ddabb34e542ed65c395abc1fbf5b6c3e730396f15d25c49b668a1a401209da937e5609680cb30bff4a7661364ca1d1851c2506fa80c443f00a3d3bf7365004c6b6304f62b0e5cb175210270e75970bb20029b3879ec76c4acd320a8d0589e003636264d01a7d566504bfbac6782012088a9142fb610d856c19fd57f2d0cffe8dff689074b3d8a882103f368228456c940ac113e53dad5c104cf209f2f102a409207269383b6ab9b03deac68ffffffff01d0dc9800000000001976a9146d9d2b554d768232320587df75c4338ecc8bf37d88ac40280e5c").unwrap();
@@ -139,7 +143,11 @@ fn test_extract_secret() {
 
 #[test]
 fn test_generate_transaction() {
-    let client = electrum_client_for_test(&["electrum1.cipig.net:10017"]);
+    let client = electrum_client_for_test(&[
+        "electrum1.cipig.net:10017",
+        "electrum2.cipig.net:10017",
+        "electrum3.cipig.net:10017",
+    ]);
     let coin = utxo_coin_for_test(client.into(), None);
     let unspents = vec![UnspentInfo {
         value: 10000000000,
@@ -152,7 +160,10 @@ fn test_generate_transaction() {
         value: 999,
     }];
 
-    let generated = block_on(coin.generate_transaction(unspents, outputs, FeePolicy::SendExact, None, None));
+    let builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs);
+    let generated = block_on(builder.build());
     // must not allow to use output with value < dust
     generated.unwrap_err();
 
@@ -167,9 +178,10 @@ fn test_generate_transaction() {
         value: 98001,
     }];
 
-    let generated =
-        block_on(coin.generate_transaction(unspents.clone(), outputs.clone(), FeePolicy::SendExact, None, None))
-            .unwrap();
+    let builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs);
+    let generated = block_on(builder.build()).unwrap();
     // the change that is less than dust must be included to miner fee
     // so no extra outputs should appear in generated transaction
     assert_eq!(generated.0.outputs.len(), 1);
@@ -191,8 +203,12 @@ fn test_generate_transaction() {
     }];
 
     // test that fee is properly deducted from output amount equal to input amount (max withdraw case)
-    let generated =
-        block_on(coin.generate_transaction(unspents, outputs, FeePolicy::DeductFromOutput(0), None, None)).unwrap();
+    let builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs)
+        .with_fee_policy(FeePolicy::DeductFromOutput(0));
+
+    let generated = block_on(builder.build()).unwrap();
     assert_eq!(generated.0.outputs.len(), 1);
 
     assert_eq!(generated.1.fee_amount, 1000);
@@ -213,7 +229,11 @@ fn test_generate_transaction() {
     }];
 
     // test that generate_transaction returns an error when input amount is not sufficient to cover output + fee
-    block_on(coin.generate_transaction(unspents, outputs, FeePolicy::SendExact, None, None)).unwrap_err();
+    let builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs);
+
+    block_on(builder.build()).unwrap_err();
 }
 
 #[test]
@@ -953,7 +973,7 @@ fn test_electrum_rpc_client_error() {
     let expected = r#"JsonRpcError { client_info: "coin: RICK", request: JsonRpcRequest { jsonrpc: "2.0", id: "0", method: "blockchain.transaction.get", params: [String("0000000000000000000000000000000000000000000000000000000000000000"), Bool(true)] }, error: Response(electrum1.cipig.net:10060, Object({"code": Number(2), "message": String("daemon error: DaemonError({\'code\': -5, \'message\': \'No such mempool or blockchain transaction. Use gettransaction for wallet transactions.\'})")})) }"#;
     let actual = format!("{}", err);
 
-    assert_eq!(expected, actual);
+    assert!(actual.contains(expected));
 }
 
 #[test]
@@ -1066,14 +1086,12 @@ fn test_generate_transaction_relay_fee_is_used_when_dynamic_fee_is_lower() {
         value: 900000000,
     }];
 
-    let fut = coin.generate_transaction(
-        unspents,
-        outputs,
-        FeePolicy::SendExact,
-        Some(ActualTxFee::Dynamic(100)),
-        None,
-    );
-    let generated = block_on(fut).unwrap();
+    let builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs)
+        .with_fee(ActualTxFee::Dynamic(100));
+
+    let generated = block_on(builder.build()).unwrap();
     assert_eq!(generated.0.outputs.len(), 1);
 
     // generated transaction fee must be equal to relay fee if calculated dynamic fee is lower than relay
@@ -1113,14 +1131,13 @@ fn test_generate_tx_fee_is_correct_when_dynamic_fee_is_larger_than_relay() {
         value: 19000000000,
     }];
 
-    let fut = coin.generate_transaction(
-        unspents,
-        outputs,
-        FeePolicy::SendExact,
-        Some(ActualTxFee::Dynamic(1000)),
-        None,
-    );
-    let generated = block_on(fut).unwrap();
+    let builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs)
+        .with_fee(ActualTxFee::Dynamic(1000));
+
+    let generated = block_on(builder.build()).unwrap();
+
     assert_eq!(generated.0.outputs.len(), 2);
     assert_eq!(generated.0.inputs.len(), 20);
 
@@ -1382,7 +1399,7 @@ fn test_unavailable_electrum_proto_version() {
     let conf = json!({"coin":"RICK","asset":"RICK","rpcport":8923});
     let req = json!({
          "method": "electrum",
-         "servers": [{"url":"electrum1.cipig.net:10017"}],
+         "servers": [{"url":"electrum1.cipig.net:10017"},{"url":"electrum2.cipig.net:10017"},{"url":"electrum3.cipig.net:10017"}],
     });
 
     let ctx = MmCtxBuilder::new().into_mm_arc();
@@ -1392,7 +1409,7 @@ fn test_unavailable_electrum_proto_version() {
     .err()
     .unwrap();
     log!("Error: "(error));
-    assert!(error.contains("There are no Electrums with the required protocol version"));
+    assert!(error.contains("Failed protocol version verifying of at least 1 of Electrums"));
 }
 
 #[test]
@@ -1649,7 +1666,11 @@ fn test_ordered_mature_unspents_from_cache_impl(
 ) {
     const TX_HASH: &str = "0a0fda88364b960000f445351fe7678317a1e0c80584de0413377ede00ba696f";
     let tx_hash: H256Json = hex::decode(TX_HASH).unwrap().as_slice().into();
-    let client = electrum_client_for_test(&["electrum1.cipig.net:10017"]);
+    let client = electrum_client_for_test(&[
+        "electrum1.cipig.net:10017",
+        "electrum2.cipig.net:10017",
+        "electrum3.cipig.net:10017",
+    ]);
     let mut verbose = client.get_verbose_transaction(tx_hash.clone()).wait().unwrap();
     verbose.confirmations = cached_confs;
     verbose.height = cached_height;
@@ -2486,8 +2507,10 @@ fn test_generate_tx_doge_fee() {
         value: 100000000,
         script_pubkey: vec![0; 26].into(),
     }];
-    let policy = FeePolicy::SendExact;
-    let (_, data) = block_on(generate_transaction(&doge, unspents, outputs, policy, None, None)).unwrap();
+    let builder = UtxoTxBuilder::new(&doge)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs);
+    let (_, data) = block_on(builder.build()).unwrap();
     let expected_fee = 100000000;
     assert_eq!(expected_fee, data.fee_amount);
 
@@ -2504,8 +2527,11 @@ fn test_generate_tx_doge_fee() {
         .clone();
         40
     ];
-    let policy = FeePolicy::SendExact;
-    let (_, data) = block_on(generate_transaction(&doge, unspents, outputs, policy, None, None)).unwrap();
+
+    let builder = UtxoTxBuilder::new(&doge)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs);
+    let (_, data) = block_on(builder.build()).unwrap();
     let expected_fee = 200000000;
     assert_eq!(expected_fee, data.fee_amount);
 
@@ -2522,8 +2548,11 @@ fn test_generate_tx_doge_fee() {
         .clone();
         60
     ];
-    let policy = FeePolicy::SendExact;
-    let (_, data) = block_on(generate_transaction(&doge, unspents, outputs, policy, None, None)).unwrap();
+
+    let builder = UtxoTxBuilder::new(&doge)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs);
+    let (_, data) = block_on(builder.build()).unwrap();
     let expected_fee = 300000000;
     assert_eq!(expected_fee, data.fee_amount);
 }

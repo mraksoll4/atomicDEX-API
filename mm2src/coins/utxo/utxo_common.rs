@@ -274,220 +274,282 @@ where
     Box::new(fut.boxed().compat().map(|tx| tx.into()))
 }
 
-/// Generates unsigned transaction (TransactionInputSigner) from specified utxos and outputs.
-/// This function expects that utxos are sorted by amounts in ascending order
-/// Consider sorting before calling this function
-/// Sends the change (inputs amount - outputs amount) to "my_address"
-/// Also returns additional transaction data
-///
-/// Note `gas_fee` should be enough to execute all of the contract calls within UTXO outputs.
-/// QRC20 specific: `gas_fee` should be calculated by: gas_limit * gas_price * (count of contract calls),
-/// or should be sum of gas fee of all contract calls.
-pub async fn generate_transaction<T>(
-    coin: &T,
-    utxos: Vec<UnspentInfo>,
+pub struct UtxoTxBuilder<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> {
+    coin: &'a T,
+    /// The inputs that *must* be included in the resulting tx
+    required_inputs: Vec<UnspentInfo>,
+    /// The available inputs that *can* be included in the resulting tx
+    available_inputs: Vec<UnspentInfo>,
+    /// Transaction outputs
     outputs: Vec<TransactionOutput>,
     fee_policy: FeePolicy,
     fee: Option<ActualTxFee>,
     gas_fee: Option<u64>,
-) -> GenerateTxResult
-where
-    T: AsRef<UtxoCoinFields> + UtxoCommonOps,
-{
-    let dust: u64 = coin.as_ref().dust_amount;
-    let lock_time = (now_ms() / 1000) as u32;
-    let change_script_pubkey = Builder::build_p2pkh(&coin.as_ref().my_address.hash).to_bytes();
-    let coin_tx_fee = match fee {
-        Some(f) => f,
-        None => coin.get_tx_fee().await?,
-    };
+}
 
-    true_or!(!outputs.is_empty(), GenerateTxError::EmptyOutputs);
-
-    let mut sum_outputs_value = 0;
-    let mut received_by_me = 0;
-    for output in outputs.iter() {
-        let script: Script = output.script_pubkey.clone().into();
-        if script.opcodes().next() != Some(Ok(Opcode::OP_RETURN)) {
-            true_or!(output.value >= dust, GenerateTxError::OutputValueLessThanDust {
-                value: output.value,
-                dust
-            });
-        }
-        sum_outputs_value += output.value;
-        if output.script_pubkey == change_script_pubkey {
-            received_by_me += output.value;
+impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
+    pub fn new(coin: &'a T) -> Self {
+        UtxoTxBuilder {
+            coin,
+            required_inputs: vec![],
+            available_inputs: vec![],
+            outputs: vec![],
+            fee_policy: FeePolicy::SendExact,
+            fee: None,
+            gas_fee: None,
         }
     }
 
-    if let Some(gas_fee) = gas_fee {
-        sum_outputs_value += gas_fee;
+    pub fn add_required_inputs(mut self, inputs: impl IntoIterator<Item = UnspentInfo>) -> Self {
+        self.required_inputs.extend(inputs);
+        self
     }
 
-    true_or!(!utxos.is_empty(), GenerateTxError::EmptyUtxoSet {
-        required: sum_outputs_value
-    });
+    /// This function expects that utxos are sorted by amounts in ascending order
+    /// Consider sorting before calling this function
+    pub fn add_available_inputs(mut self, inputs: impl IntoIterator<Item = UnspentInfo>) -> Self {
+        self.available_inputs.extend(inputs);
+        self
+    }
 
-    let str_d_zeel = if coin.as_ref().conf.ticker == "NAV" {
-        Some("".into())
-    } else {
-        None
-    };
-    let hash_algo = coin.as_ref().tx_hash_algo.into();
-    let mut tx = TransactionInputSigner {
-        inputs: vec![],
-        outputs,
-        lock_time,
-        version: coin.as_ref().conf.tx_version,
-        n_time: if coin.as_ref().conf.is_pos {
-            Some((now_ms() / 1000) as u32)
-        } else {
-            None
-        },
-        overwintered: coin.as_ref().conf.overwintered,
-        expiry_height: 0,
-        join_splits: vec![],
-        shielded_spends: vec![],
-        shielded_outputs: vec![],
-        value_balance: 0,
-        version_group_id: coin.as_ref().conf.version_group_id,
-        consensus_branch_id: coin.as_ref().conf.consensus_branch_id,
-        zcash: coin.as_ref().conf.zcash,
-        str_d_zeel,
-        hash_algo,
-    };
-    let mut sum_inputs = 0;
-    let mut tx_fee = 0;
-    let min_relay_fee = if coin.as_ref().conf.force_min_relay_fee {
-        let fee_dec = coin.as_ref().rpc_client.get_relay_fee().compat().await?;
-        let min_relay_fee = sat_from_big_decimal(&fee_dec, coin.as_ref().decimals)?;
-        Some(min_relay_fee)
-    } else {
-        None
-    };
-    for utxo in utxos.iter() {
-        sum_inputs += utxo.value;
-        tx.inputs.push(UnsignedTransactionInput {
-            previous_output: utxo.outpoint.clone(),
-            sequence: SEQUENCE_FINAL,
-            amount: utxo.value,
-        });
-        tx_fee = match &coin_tx_fee {
-            ActualTxFee::Fixed(f) => *f,
-            ActualTxFee::Dynamic(f) => {
-                let transaction = UtxoTx::from(tx.clone());
-                let transaction_bytes = serialize(&transaction);
-                // 2 bytes are used to indicate the length of signature and pubkey
-                // total is 107
-                let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
-                let tx_size = transaction_bytes.len() + transaction.inputs().len() * additional_len;
-                (f * tx_size as u64) / KILO_BYTE
-            },
-            ActualTxFee::FixedPerKb(f) => {
-                let transaction = UtxoTx::from(tx.clone());
-                let transaction_bytes = serialize(&transaction);
-                // 2 bytes are used to indicate the length of signature and pubkey
-                // total is 107
-                let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
-                let tx_size_bytes = (transaction_bytes.len() + transaction.inputs().len() * additional_len) as u64;
-                let tx_size_kb = if tx_size_bytes % KILO_BYTE == 0 {
-                    tx_size_bytes / KILO_BYTE
-                } else {
-                    tx_size_bytes / KILO_BYTE + 1
-                };
-                f * tx_size_kb
-            },
+    pub fn add_outputs(mut self, outputs: impl IntoIterator<Item = TransactionOutput>) -> Self {
+        self.outputs.extend(outputs);
+        self
+    }
+
+    pub fn with_fee_policy(mut self, new_policy: FeePolicy) -> Self {
+        self.fee_policy = new_policy;
+        self
+    }
+
+    pub fn with_fee(mut self, fee: ActualTxFee) -> Self {
+        self.fee = Some(fee);
+        self
+    }
+
+    /// Note `gas_fee` should be enough to execute all of the contract calls within UTXO outputs.
+    /// QRC20 specific: `gas_fee` should be calculated by: gas_limit * gas_price * (count of contract calls),
+    /// or should be sum of gas fee of all contract calls.
+    pub fn with_gas_fee(mut self, gas_fee: u64) -> Self {
+        self.gas_fee = Some(gas_fee);
+        self
+    }
+
+    /// Generates unsigned transaction (TransactionInputSigner) from specified utxos and outputs.
+    /// Sends the change (inputs amount - outputs amount) to "my_address"
+    /// Also returns additional transaction data
+    pub async fn build(self) -> GenerateTxResult {
+        let coin = self.coin;
+        let dust: u64 = coin.as_ref().dust_amount;
+        let lock_time = (now_ms() / 1000) as u32;
+        let change_script_pubkey = Builder::build_p2pkh(&coin.as_ref().my_address.hash).to_bytes();
+        let coin_tx_fee = match self.fee {
+            Some(f) => f,
+            None => coin.get_tx_fee().await?,
         };
 
-        match fee_policy {
-            FeePolicy::SendExact => {
-                let mut outputs_plus_fee = sum_outputs_value + tx_fee;
-                if sum_inputs >= outputs_plus_fee {
-                    let change = sum_inputs - outputs_plus_fee;
-                    if change > dust {
-                        // there will be change output
-                        if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
-                            tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
-                            outputs_plus_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
-                        }
-                    }
-                    if let Some(min_relay) = min_relay_fee {
-                        if tx_fee < min_relay {
-                            outputs_plus_fee -= tx_fee;
-                            outputs_plus_fee += min_relay;
-                            tx_fee = min_relay;
-                        }
-                    }
-                    if sum_inputs >= outputs_plus_fee {
-                        break;
-                    }
-                }
+        true_or!(!self.outputs.is_empty(), GenerateTxError::EmptyOutputs);
+
+        let mut sum_outputs_value = 0;
+        let mut received_by_me = 0;
+        for output in self.outputs.iter() {
+            let script: Script = output.script_pubkey.clone().into();
+            if script.opcodes().next() != Some(Ok(Opcode::OP_RETURN)) {
+                true_or!(output.value >= dust, GenerateTxError::OutputValueLessThanDust {
+                    value: output.value,
+                    dust
+                });
+            }
+            sum_outputs_value += output.value;
+            if output.script_pubkey == change_script_pubkey {
+                received_by_me += output.value;
+            }
+        }
+
+        if let Some(gas_fee) = self.gas_fee {
+            sum_outputs_value += gas_fee;
+        }
+
+        true_or!(
+            !self.available_inputs.is_empty() || !self.required_inputs.is_empty(),
+            GenerateTxError::EmptyUtxoSet {
+                required: sum_outputs_value
+            }
+        );
+
+        let str_d_zeel = if coin.as_ref().conf.ticker == "NAV" {
+            Some("".into())
+        } else {
+            None
+        };
+        let hash_algo = coin.as_ref().tx_hash_algo.into();
+        let mut tx = TransactionInputSigner {
+            inputs: vec![],
+            outputs: self.outputs,
+            lock_time,
+            version: coin.as_ref().conf.tx_version,
+            n_time: if coin.as_ref().conf.is_pos {
+                Some((now_ms() / 1000) as u32)
+            } else {
+                None
             },
-            FeePolicy::DeductFromOutput(_) => {
-                if sum_inputs >= sum_outputs_value {
-                    let change = sum_inputs - sum_outputs_value;
-                    if change > dust {
-                        if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
-                            tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+            overwintered: coin.as_ref().conf.overwintered,
+            expiry_height: 0,
+            join_splits: vec![],
+            shielded_spends: vec![],
+            shielded_outputs: vec![],
+            value_balance: 0,
+            version_group_id: coin.as_ref().conf.version_group_id,
+            consensus_branch_id: coin.as_ref().conf.consensus_branch_id,
+            zcash: coin.as_ref().conf.zcash,
+            str_d_zeel,
+            hash_algo,
+        };
+        let mut sum_inputs = 0;
+        let mut tx_fee = 0;
+        let min_relay_fee = if coin.as_ref().conf.force_min_relay_fee {
+            let fee_dec = coin.as_ref().rpc_client.get_relay_fee().compat().await?;
+            let min_relay_fee = sat_from_big_decimal(&fee_dec, coin.as_ref().decimals)?;
+            Some(min_relay_fee)
+        } else {
+            None
+        };
+
+        for utxo in self.required_inputs {
+            sum_inputs += utxo.value;
+            tx.inputs.push(UnsignedTransactionInput {
+                previous_output: utxo.outpoint,
+                sequence: SEQUENCE_FINAL,
+                amount: utxo.value,
+            });
+        }
+
+        for utxo in self.available_inputs {
+            tx.inputs.push(UnsignedTransactionInput {
+                previous_output: utxo.outpoint.clone(),
+                sequence: SEQUENCE_FINAL,
+                amount: utxo.value,
+            });
+            sum_inputs += utxo.value;
+
+            tx_fee = match &coin_tx_fee {
+                ActualTxFee::Fixed(f) => *f,
+                ActualTxFee::Dynamic(f) => {
+                    let transaction = UtxoTx::from(tx.clone());
+                    let transaction_bytes = serialize(&transaction);
+                    // 2 bytes are used to indicate the length of signature and pubkey
+                    // total is 107
+                    let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
+                    let tx_size = transaction_bytes.len() + transaction.inputs().len() * additional_len;
+                    (f * tx_size as u64) / KILO_BYTE
+                },
+                ActualTxFee::FixedPerKb(f) => {
+                    let transaction = UtxoTx::from(tx.clone());
+                    let transaction_bytes = serialize(&transaction);
+                    // 2 bytes are used to indicate the length of signature and pubkey
+                    // total is 107
+                    let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
+                    let tx_size_bytes = (transaction_bytes.len() + transaction.inputs().len() * additional_len) as u64;
+                    let tx_size_kb = if tx_size_bytes % KILO_BYTE == 0 {
+                        tx_size_bytes / KILO_BYTE
+                    } else {
+                        tx_size_bytes / KILO_BYTE + 1
+                    };
+                    f * tx_size_kb
+                },
+            };
+
+            match self.fee_policy {
+                FeePolicy::SendExact => {
+                    let mut outputs_plus_fee = sum_outputs_value + tx_fee;
+                    if sum_inputs >= outputs_plus_fee {
+                        let change = sum_inputs - outputs_plus_fee;
+                        if change > dust {
+                            // there will be change output
+                            if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
+                                tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+                                outputs_plus_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+                            }
                         }
                         if let Some(min_relay) = min_relay_fee {
                             if tx_fee < min_relay {
+                                outputs_plus_fee -= tx_fee;
+                                outputs_plus_fee += min_relay;
                                 tx_fee = min_relay;
                             }
                         }
+                        if sum_inputs >= outputs_plus_fee {
+                            break;
+                        }
                     }
-                    break;
+                },
+                FeePolicy::DeductFromOutput(_) => {
+                    if sum_inputs >= sum_outputs_value {
+                        let change = sum_inputs - sum_outputs_value;
+                        if change > dust {
+                            if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
+                                tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+                            }
+                            if let Some(min_relay) = min_relay_fee {
+                                if tx_fee < min_relay {
+                                    tx_fee = min_relay;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                },
+            };
+        }
+
+        match self.fee_policy {
+            FeePolicy::SendExact => sum_outputs_value += tx_fee,
+            FeePolicy::DeductFromOutput(i) => {
+                let min_output = tx_fee + dust;
+                let val = tx.outputs[i].value;
+                true_or!(val >= min_output, GenerateTxError::DeductFeeFromOutputFailed {
+                    output_idx: i,
+                    output_value: val,
+                    required: min_output,
+                });
+                tx.outputs[i].value -= tx_fee;
+                if tx.outputs[i].script_pubkey == change_script_pubkey {
+                    received_by_me -= tx_fee;
                 }
             },
         };
-    }
-    match fee_policy {
-        FeePolicy::SendExact => sum_outputs_value += tx_fee,
-        FeePolicy::DeductFromOutput(i) => {
-            let min_output = tx_fee + dust;
-            let val = tx.outputs[i].value;
-            true_or!(val >= min_output, GenerateTxError::DeductFeeFromOutputFailed {
-                output_idx: i,
-                output_value: val,
-                required: min_output,
-            });
-            tx.outputs[i].value -= tx_fee;
-            if tx.outputs[i].script_pubkey == change_script_pubkey {
-                received_by_me -= tx_fee;
-            }
-        },
-    };
-    true_or!(sum_inputs >= sum_outputs_value, GenerateTxError::NotEnoughUtxos {
-        sum_utxos: sum_inputs,
-        required: sum_outputs_value
-    });
-
-    let change = sum_inputs - sum_outputs_value;
-    let unused_change = if change > dust {
-        tx.outputs.push({
-            TransactionOutput {
-                value: change,
-                script_pubkey: change_script_pubkey.clone(),
-            }
+        true_or!(sum_inputs >= sum_outputs_value, GenerateTxError::NotEnoughUtxos {
+            sum_utxos: sum_inputs,
+            required: sum_outputs_value
         });
-        received_by_me += change;
-        None
-    } else if change > 0 {
-        Some(change)
-    } else {
-        None
-    };
 
-    let data = AdditionalTxData {
-        fee_amount: tx_fee,
-        received_by_me,
-        spent_by_me: sum_inputs,
-        unused_change,
-        // will be changed if the ticker is KMD
-        kmd_rewards: None,
-    };
+        let change = sum_inputs - sum_outputs_value;
+        let unused_change = if change > dust {
+            tx.outputs.push({
+                TransactionOutput {
+                    value: change,
+                    script_pubkey: change_script_pubkey.clone(),
+                }
+            });
+            received_by_me += change;
+            None
+        } else if change > 0 {
+            Some(change)
+        } else {
+            None
+        };
 
-    Ok(coin.calc_interest_if_required(tx, data, change_script_pubkey).await?)
+        let data = AdditionalTxData {
+            fee_amount: tx_fee,
+            received_by_me,
+            spent_by_me: sum_inputs,
+            unused_change,
+            // will be changed if the ticker is KMD
+            kmd_rewards: None,
+        };
+
+        Ok(coin.calc_interest_if_required(tx, data, change_script_pubkey).await?)
+    }
 }
 
 /// Calculates interest if the coin is KMD
@@ -1404,14 +1466,20 @@ where
         (value, FeePolicy::SendExact)
     };
     let outputs = vec![TransactionOutput { value, script_pubkey }];
-    let fee = match req.fee {
+
+    let mut tx_builder = UtxoTxBuilder::new(&coin)
+        .add_available_inputs(unspents)
+        .add_outputs(outputs)
+        .with_fee_policy(fee_policy);
+
+    match req.fee {
         Some(WithdrawFee::UtxoFixed { amount }) => {
             let fixed = sat_from_big_decimal(&amount, decimals)?;
-            Some(ActualTxFee::Fixed(fixed))
+            tx_builder = tx_builder.with_fee(ActualTxFee::Fixed(fixed));
         },
         Some(WithdrawFee::UtxoPerKbyte { amount }) => {
             let dynamic = sat_from_big_decimal(&amount, decimals)?;
-            Some(ActualTxFee::Dynamic(dynamic))
+            tx_builder = tx_builder.with_fee(ActualTxFee::Dynamic(dynamic));
         },
         Some(fee_policy) => {
             let error = format!(
@@ -1420,15 +1488,11 @@ where
             );
             return MmError::err(WithdrawError::InvalidFeePolicy(error));
         },
-        None => None,
+        None => (),
     };
-    let gas_fee = None;
-    let (unsigned, data) = coin
-        .generate_transaction(unspents, outputs, fee_policy, fee, gas_fee)
-        .await
-        .mm_err(|gen_tx_error| {
-            WithdrawError::from_generate_tx_error(gen_tx_error, coin.ticker().to_owned(), decimals)
-        })?;
+    let (unsigned, data) = tx_builder.build().await.mm_err(|gen_tx_error| {
+        WithdrawError::from_generate_tx_error(gen_tx_error, coin.ticker().to_owned(), decimals)
+    })?;
     let prev_script = Builder::build_p2pkh(&coin.as_ref().my_address.hash);
     let signed = sign_tx(
         unsigned,
@@ -2130,8 +2194,18 @@ where
             let outputs_count = outputs.len();
             let (unspents, _recently_sent_txs) = coin.list_unspent_ordered(&coin.as_ref().my_address).await?;
 
-            let actual_tx_fee = Some(ActualTxFee::Dynamic(dynamic_fee));
-            let (tx, data) = generate_transaction(coin, unspents, outputs, fee_policy, actual_tx_fee, gas_fee)
+            let actual_tx_fee = ActualTxFee::Dynamic(dynamic_fee);
+
+            let mut tx_builder = UtxoTxBuilder::new(coin)
+                .add_available_inputs(unspents)
+                .add_outputs(outputs)
+                .with_fee_policy(fee_policy)
+                .with_fee(actual_tx_fee);
+            if let Some(gas) = gas_fee {
+                tx_builder = tx_builder.with_gas_fee(gas);
+            }
+            let (tx, data) = tx_builder
+                .build()
                 .await
                 .mm_err(|e| TradePreimageError::from_generate_tx_error(e, ticker, decimals, is_amount_upper_bound))?;
 
@@ -2149,7 +2223,16 @@ where
             let outputs_count = outputs.len();
             let (unspents, _recently_sent_txs) = coin.list_unspent_ordered(&coin.as_ref().my_address).await?;
 
-            let (tx, data) = generate_transaction(coin, unspents, outputs, fee_policy, Some(tx_fee), gas_fee)
+            let mut tx_builder = UtxoTxBuilder::new(coin)
+                .add_available_inputs(unspents)
+                .add_outputs(outputs)
+                .with_fee_policy(fee_policy)
+                .with_fee(tx_fee);
+            if let Some(gas) = gas_fee {
+                tx_builder = tx_builder.with_gas_fee(gas);
+            }
+            let (tx, data) = tx_builder
+                .build()
                 .await
                 .mm_err(|e| TradePreimageError::from_generate_tx_error(e, ticker, decimals, is_amount_upper_bound))?;
 
@@ -2851,9 +2934,10 @@ async fn merge_utxo_loop<T>(
             let merge_tx_fut = generate_and_send_tx(
                 &coin,
                 unspents,
-                vec![output],
+                None,
                 FeePolicy::DeductFromOutput(0),
                 recently_spent,
+                vec![output],
             );
             match merge_tx_fut.await {
                 Ok(tx) => info!(
