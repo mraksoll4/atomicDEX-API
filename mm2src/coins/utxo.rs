@@ -486,9 +486,21 @@ impl UtxoCoinFields {
             (now_ms() / 1000) as u32
         };
 
+        let str_d_zeel = if self.conf.ticker == "NAV" {
+            Some("".into())
+        } else {
+            None
+        };
+
+        let n_time = if self.conf.is_pos {
+            Some((now_ms() / 1000) as u32)
+        } else {
+            None
+        };
+
         TransactionInputSigner {
             version: self.conf.tx_version,
-            n_time: None,
+            n_time,
             overwintered: self.conf.overwintered,
             version_group_id: self.conf.version_group_id,
             consensus_branch_id: self.conf.consensus_branch_id,
@@ -501,7 +513,7 @@ impl UtxoCoinFields {
             shielded_spends: vec![],
             shielded_outputs: vec![],
             zcash: self.conf.zcash,
-            str_d_zeel: None,
+            str_d_zeel,
             hash_algo: self.tx_hash_algo.into(),
         }
     }

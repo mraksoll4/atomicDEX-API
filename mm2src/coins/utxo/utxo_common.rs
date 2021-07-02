@@ -325,13 +325,90 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
         self
     }
 
+    /// Recalculates fee and checks whether transaction is complete (inputs collected cover the outputs)
+    fn recalc_fee_and_check_completeness(&mut self, tx: &TransactionInputSigner) -> bool {
+        self.tx_fee = match &coin_tx_fee {
+            ActualTxFee::Fixed(f) => *f,
+            ActualTxFee::Dynamic(f) => {
+                let transaction = UtxoTx::from(tx.clone());
+                let transaction_bytes = serialize(&transaction);
+                // 2 bytes are used to indicate the length of signature and pubkey
+                // total is 107
+                let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
+                let tx_size = transaction_bytes.len() + transaction.inputs().len() * additional_len;
+                (f * tx_size as u64) / KILO_BYTE
+            },
+            ActualTxFee::FixedPerKb(f) => {
+                let transaction = UtxoTx::from(tx.clone());
+                let transaction_bytes = serialize(&transaction);
+                // 2 bytes are used to indicate the length of signature and pubkey
+                // total is 107
+                let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
+                let tx_size_bytes = (transaction_bytes.len() + transaction.inputs().len() * additional_len) as u64;
+                let tx_size_kb = if tx_size_bytes % KILO_BYTE == 0 {
+                    tx_size_bytes / KILO_BYTE
+                } else {
+                    tx_size_bytes / KILO_BYTE + 1
+                };
+                f * tx_size_kb
+            },
+        };
+
+        match self.fee_policy {
+            FeePolicy::SendExact => {
+                let mut outputs_plus_fee = self.sum_outputs_value + self.tx_fee;
+                if self.sum_inputs >= outputs_plus_fee {
+                    self.change = sum_inputs - outputs_plus_fee;
+                    if self.change > dust {
+                        // there will be change output
+                        if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
+                            self.tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+                            outputs_plus_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+                        }
+                    }
+                    if let Some(min_relay) = self.min_relay_fee {
+                        if tx_fee < min_relay {
+                            outputs_plus_fee -= self.tx_fee;
+                            outputs_plus_fee += min_relay;
+                            self.tx_fee = min_relay;
+                        }
+                    }
+                    if self.sum_inputs >= outputs_plus_fee {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            },
+            FeePolicy::DeductFromOutput(_) => {
+                if sum_inputs >= sum_outputs_value {
+                    self.change = sum_inputs - sum_outputs_value;
+                    if self.change > dust {
+                        if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
+                            self.tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
+                        }
+                        if let Some(min_relay) = self.min_relay_fee {
+                            if self.tx_fee < min_relay {
+                                tx_fee = min_relay;
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            },
+        }
+    }
+
     /// Generates unsigned transaction (TransactionInputSigner) from specified utxos and outputs.
     /// Sends the change (inputs amount - outputs amount) to "my_address"
     /// Also returns additional transaction data
-    pub async fn build(self) -> GenerateTxResult {
+    pub async fn build(mut self) -> GenerateTxResult {
         let coin = self.coin;
         let dust: u64 = coin.as_ref().dust_amount;
-        let lock_time = (now_ms() / 1000) as u32;
         let change_script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
         let coin_tx_fee = match self.fee {
             Some(f) => f,
@@ -367,34 +444,9 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
             }
         );
 
-        let str_d_zeel = if coin.as_ref().conf.ticker == "NAV" {
-            Some("".into())
-        } else {
-            None
-        };
-        let hash_algo = coin.as_ref().tx_hash_algo.into();
-        let mut tx = TransactionInputSigner {
-            inputs: vec![],
-            outputs: self.outputs,
-            lock_time,
-            version: coin.as_ref().conf.tx_version,
-            n_time: if coin.as_ref().conf.is_pos {
-                Some((now_ms() / 1000) as u32)
-            } else {
-                None
-            },
-            overwintered: coin.as_ref().conf.overwintered,
-            expiry_height: 0,
-            join_splits: vec![],
-            shielded_spends: vec![],
-            shielded_outputs: vec![],
-            value_balance: 0,
-            version_group_id: coin.as_ref().conf.version_group_id,
-            consensus_branch_id: coin.as_ref().conf.consensus_branch_id,
-            zcash: coin.as_ref().conf.zcash,
-            str_d_zeel,
-            hash_algo,
-        };
+        let mut tx = coin.as_ref().transaction_preimage();
+        tx.outputs = self.outputs;
+
         let mut sum_inputs = 0;
         let mut tx_fee = 0;
         let min_relay_fee = if coin.as_ref().conf.force_min_relay_fee {
@@ -405,14 +457,15 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
             None
         };
 
-        for utxo in self.required_inputs {
-            sum_inputs += utxo.value;
-            tx.inputs.push(UnsignedTransactionInput {
-                previous_output: utxo.outpoint,
-                sequence: SEQUENCE_FINAL,
-                amount: utxo.value,
-                witness: vec![],
-            });
+        if !self.required_inputs.is_empty() {
+            sum_inputs += self.required_inputs.iter().fold(0, |sum, cur| sum + cur.value);
+            tx.inputs
+                .extend(self.required_inputs.into_iter().map(|utxo| UnsignedTransactionInput {
+                    previous_output: utxo.outpoint,
+                    sequence: SEQUENCE_FINAL,
+                    amount: utxo.value,
+                    witness: vec![],
+                }));
         }
 
         for utxo in self.available_inputs {
@@ -424,74 +477,9 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
             });
             sum_inputs += utxo.value;
 
-            tx_fee = match &coin_tx_fee {
-                ActualTxFee::Fixed(f) => *f,
-                ActualTxFee::Dynamic(f) => {
-                    let transaction = UtxoTx::from(tx.clone());
-                    let transaction_bytes = serialize(&transaction);
-                    // 2 bytes are used to indicate the length of signature and pubkey
-                    // total is 107
-                    let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
-                    let tx_size = transaction_bytes.len() + transaction.inputs().len() * additional_len;
-                    (f * tx_size as u64) / KILO_BYTE
-                },
-                ActualTxFee::FixedPerKb(f) => {
-                    let transaction = UtxoTx::from(tx.clone());
-                    let transaction_bytes = serialize(&transaction);
-                    // 2 bytes are used to indicate the length of signature and pubkey
-                    // total is 107
-                    let additional_len = 2 + MAX_DER_SIGNATURE_LEN + COMPRESSED_PUBKEY_LEN;
-                    let tx_size_bytes = (transaction_bytes.len() + transaction.inputs().len() * additional_len) as u64;
-                    let tx_size_kb = if tx_size_bytes % KILO_BYTE == 0 {
-                        tx_size_bytes / KILO_BYTE
-                    } else {
-                        tx_size_bytes / KILO_BYTE + 1
-                    };
-                    f * tx_size_kb
-                },
-            };
-
-            match self.fee_policy {
-                FeePolicy::SendExact => {
-                    let mut outputs_plus_fee = sum_outputs_value + tx_fee;
-                    if sum_inputs >= outputs_plus_fee {
-                        let change = sum_inputs - outputs_plus_fee;
-                        if change > dust {
-                            // there will be change output
-                            if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
-                                tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
-                                outputs_plus_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
-                            }
-                        }
-                        if let Some(min_relay) = min_relay_fee {
-                            if tx_fee < min_relay {
-                                outputs_plus_fee -= tx_fee;
-                                outputs_plus_fee += min_relay;
-                                tx_fee = min_relay;
-                            }
-                        }
-                        if sum_inputs >= outputs_plus_fee {
-                            break;
-                        }
-                    }
-                },
-                FeePolicy::DeductFromOutput(_) => {
-                    if sum_inputs >= sum_outputs_value {
-                        let change = sum_inputs - sum_outputs_value;
-                        if change > dust {
-                            if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
-                                tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
-                            }
-                            if let Some(min_relay) = min_relay_fee {
-                                if tx_fee < min_relay {
-                                    tx_fee = min_relay;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                },
-            };
+            if self.recalc_fee_and_check_completeness(&tx) {
+                break;
+            }
         }
 
         match self.fee_policy {
