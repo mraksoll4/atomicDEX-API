@@ -266,32 +266,45 @@ where
 
 pub struct UtxoTxBuilder<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> {
     coin: &'a T,
-    /// The inputs that *must* be included in the resulting tx
-    required_inputs: Vec<UnspentInfo>,
     /// The available inputs that *can* be included in the resulting tx
     available_inputs: Vec<UnspentInfo>,
-    /// Transaction outputs
-    outputs: Vec<TransactionOutput>,
     fee_policy: FeePolicy,
     fee: Option<ActualTxFee>,
     gas_fee: Option<u64>,
+    tx: TransactionInputSigner,
+    change: u64,
+    sum_inputs: u64,
+    sum_outputs_value: u64,
+    tx_fee: u64,
+    min_relay_fee: Option<u64>,
 }
 
 impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
     pub fn new(coin: &'a T) -> Self {
         UtxoTxBuilder {
+            tx: coin.as_ref().transaction_preimage(),
             coin,
-            required_inputs: vec![],
             available_inputs: vec![],
-            outputs: vec![],
             fee_policy: FeePolicy::SendExact,
             fee: None,
             gas_fee: None,
+            change: 0,
+            sum_inputs: 0,
+            sum_outputs_value: 0,
+            tx_fee: 0,
+            min_relay_fee: None,
         }
     }
 
     pub fn add_required_inputs(mut self, inputs: impl IntoIterator<Item = UnspentInfo>) -> Self {
-        self.required_inputs.extend(inputs);
+        self.tx
+            .inputs
+            .extend(inputs.into_iter().map(|input| UnsignedTransactionInput {
+                previous_output: input.outpoint,
+                sequence: SEQUENCE_FINAL,
+                amount: input.value,
+                witness: Vec::new(),
+            }));
         self
     }
 
@@ -303,7 +316,7 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
     }
 
     pub fn add_outputs(mut self, outputs: impl IntoIterator<Item = TransactionOutput>) -> Self {
-        self.outputs.extend(outputs);
+        self.tx.outputs.extend(outputs);
         self
     }
 
@@ -326,11 +339,11 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
     }
 
     /// Recalculates fee and checks whether transaction is complete (inputs collected cover the outputs)
-    fn recalc_fee_and_check_completeness(&mut self, tx: &TransactionInputSigner) -> bool {
-        self.tx_fee = match &coin_tx_fee {
+    fn update_fee_and_check_completeness(&mut self, actual_tx_fee: &ActualTxFee) -> bool {
+        self.tx_fee = match &actual_tx_fee {
             ActualTxFee::Fixed(f) => *f,
             ActualTxFee::Dynamic(f) => {
-                let transaction = UtxoTx::from(tx.clone());
+                let transaction = UtxoTx::from(self.tx.clone());
                 let transaction_bytes = serialize(&transaction);
                 // 2 bytes are used to indicate the length of signature and pubkey
                 // total is 107
@@ -339,7 +352,7 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
                 (f * tx_size as u64) / KILO_BYTE
             },
             ActualTxFee::FixedPerKb(f) => {
-                let transaction = UtxoTx::from(tx.clone());
+                let transaction = UtxoTx::from(self.tx.clone());
                 let transaction_bytes = serialize(&transaction);
                 // 2 bytes are used to indicate the length of signature and pubkey
                 // total is 107
@@ -358,16 +371,16 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
             FeePolicy::SendExact => {
                 let mut outputs_plus_fee = self.sum_outputs_value + self.tx_fee;
                 if self.sum_inputs >= outputs_plus_fee {
-                    self.change = sum_inputs - outputs_plus_fee;
-                    if self.change > dust {
+                    self.change = self.sum_inputs - outputs_plus_fee;
+                    if self.change > self.dust() {
                         // there will be change output
-                        if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
+                        if let ActualTxFee::Dynamic(ref f) = actual_tx_fee {
                             self.tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
                             outputs_plus_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
                         }
                     }
                     if let Some(min_relay) = self.min_relay_fee {
-                        if tx_fee < min_relay {
+                        if self.tx_fee < min_relay {
                             outputs_plus_fee -= self.tx_fee;
                             outputs_plus_fee += min_relay;
                             self.tx_fee = min_relay;
@@ -383,15 +396,15 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
                 }
             },
             FeePolicy::DeductFromOutput(_) => {
-                if sum_inputs >= sum_outputs_value {
-                    self.change = sum_inputs - sum_outputs_value;
-                    if self.change > dust {
-                        if let ActualTxFee::Dynamic(ref f) = coin_tx_fee {
+                if self.sum_inputs >= self.sum_outputs_value {
+                    self.change = self.sum_inputs - self.sum_outputs_value;
+                    if self.change > self.dust() {
+                        if let ActualTxFee::Dynamic(ref f) = actual_tx_fee {
                             self.tx_fee += (f * P2PKH_OUTPUT_LEN) / KILO_BYTE;
                         }
                         if let Some(min_relay) = self.min_relay_fee {
                             if self.tx_fee < min_relay {
-                                tx_fee = min_relay;
+                                self.tx_fee = min_relay;
                             }
                         }
                     }
@@ -403,6 +416,8 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
         }
     }
 
+    fn dust(&self) -> u64 { self.coin.as_ref().dust_amount }
+
     /// Generates unsigned transaction (TransactionInputSigner) from specified utxos and outputs.
     /// Sends the change (inputs amount - outputs amount) to "my_address"
     /// Also returns additional transaction data
@@ -410,16 +425,16 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
         let coin = self.coin;
         let dust: u64 = coin.as_ref().dust_amount;
         let change_script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
-        let coin_tx_fee = match self.fee {
-            Some(f) => f,
+
+        let actual_tx_fee = match self.fee {
+            Some(fee) => fee,
             None => coin.get_tx_fee().await?,
         };
 
-        true_or!(!self.outputs.is_empty(), GenerateTxError::EmptyOutputs);
+        true_or!(!self.tx.outputs.is_empty(), GenerateTxError::EmptyOutputs);
 
-        let mut sum_outputs_value = 0;
         let mut received_by_me = 0;
-        for output in self.outputs.iter() {
+        for output in self.tx.outputs.iter() {
             let script: Script = output.script_pubkey.clone().into();
             if script.opcodes().next() != Some(Ok(Opcode::OP_RETURN)) {
                 true_or!(output.value >= dust, GenerateTxError::OutputValueLessThanDust {
@@ -427,29 +442,24 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
                     dust
                 });
             }
-            sum_outputs_value += output.value;
+            self.sum_outputs_value += output.value;
             if output.script_pubkey == change_script_pubkey {
                 received_by_me += output.value;
             }
         }
 
         if let Some(gas_fee) = self.gas_fee {
-            sum_outputs_value += gas_fee;
+            self.sum_outputs_value += gas_fee;
         }
 
         true_or!(
-            !self.available_inputs.is_empty() || !self.required_inputs.is_empty(),
+            !self.available_inputs.is_empty() || !self.tx.inputs.is_empty(),
             GenerateTxError::EmptyUtxoSet {
-                required: sum_outputs_value
+                required: self.sum_outputs_value
             }
         );
 
-        let mut tx = coin.as_ref().transaction_preimage();
-        tx.outputs = self.outputs;
-
-        let mut sum_inputs = 0;
-        let mut tx_fee = 0;
-        let min_relay_fee = if coin.as_ref().conf.force_min_relay_fee {
+        self.min_relay_fee = if coin.as_ref().conf.force_min_relay_fee {
             let fee_dec = coin.as_ref().rpc_client.get_relay_fee().compat().await?;
             let min_relay_fee = sat_from_big_decimal(&fee_dec, coin.as_ref().decimals)?;
             Some(min_relay_fee)
@@ -457,55 +467,47 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
             None
         };
 
-        if !self.required_inputs.is_empty() {
-            sum_inputs += self.required_inputs.iter().fold(0, |sum, cur| sum + cur.value);
-            tx.inputs
-                .extend(self.required_inputs.into_iter().map(|utxo| UnsignedTransactionInput {
-                    previous_output: utxo.outpoint,
-                    sequence: SEQUENCE_FINAL,
-                    amount: utxo.value,
-                    witness: vec![],
-                }));
-        }
-
-        for utxo in self.available_inputs {
-            tx.inputs.push(UnsignedTransactionInput {
+        for utxo in self.available_inputs.clone() {
+            self.tx.inputs.push(UnsignedTransactionInput {
                 previous_output: utxo.outpoint.clone(),
                 sequence: SEQUENCE_FINAL,
                 amount: utxo.value,
                 witness: vec![],
             });
-            sum_inputs += utxo.value;
+            self.sum_inputs += utxo.value;
 
-            if self.recalc_fee_and_check_completeness(&tx) {
+            if self.update_fee_and_check_completeness(&actual_tx_fee) {
                 break;
             }
         }
 
         match self.fee_policy {
-            FeePolicy::SendExact => sum_outputs_value += tx_fee,
+            FeePolicy::SendExact => self.sum_outputs_value += self.tx_fee,
             FeePolicy::DeductFromOutput(i) => {
-                let min_output = tx_fee + dust;
-                let val = tx.outputs[i].value;
+                let min_output = self.tx_fee + dust;
+                let val = self.tx.outputs[i].value;
                 true_or!(val >= min_output, GenerateTxError::DeductFeeFromOutputFailed {
                     output_idx: i,
                     output_value: val,
                     required: min_output,
                 });
-                tx.outputs[i].value -= tx_fee;
-                if tx.outputs[i].script_pubkey == change_script_pubkey {
-                    received_by_me -= tx_fee;
+                self.tx.outputs[i].value -= self.tx_fee;
+                if self.tx.outputs[i].script_pubkey == change_script_pubkey {
+                    received_by_me -= self.tx_fee;
                 }
             },
         };
-        true_or!(sum_inputs >= sum_outputs_value, GenerateTxError::NotEnoughUtxos {
-            sum_utxos: sum_inputs,
-            required: sum_outputs_value
-        });
+        true_or!(
+            self.sum_inputs >= self.sum_outputs_value,
+            GenerateTxError::NotEnoughUtxos {
+                sum_utxos: self.sum_inputs,
+                required: self.sum_outputs_value
+            }
+        );
 
-        let change = sum_inputs - sum_outputs_value;
+        let change = self.sum_inputs - self.sum_outputs_value;
         let unused_change = if change > dust {
-            tx.outputs.push({
+            self.tx.outputs.push({
                 TransactionOutput {
                     value: change,
                     script_pubkey: change_script_pubkey.clone(),
@@ -520,15 +522,17 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
         };
 
         let data = AdditionalTxData {
-            fee_amount: tx_fee,
+            fee_amount: self.tx_fee,
             received_by_me,
-            spent_by_me: sum_inputs,
+            spent_by_me: self.sum_inputs,
             unused_change,
             // will be changed if the ticker is KMD
             kmd_rewards: None,
         };
 
-        Ok(coin.calc_interest_if_required(tx, data, change_script_pubkey).await?)
+        Ok(coin
+            .calc_interest_if_required(self.tx, data, change_script_pubkey)
+            .await?)
     }
 }
 
