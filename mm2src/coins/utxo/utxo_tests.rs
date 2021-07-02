@@ -1378,7 +1378,7 @@ fn test_unavailable_electrum_proto_version() {
     let conf = json!({"coin":"RICK","asset":"RICK","rpcport":8923});
     let req = json!({
          "method": "electrum",
-         "servers": [{"url":"electrum1.cipig.net:10017"},{"url":"electrum2.cipig.net:10017"},{"url":"electrum3.cipig.net:10017"}],
+         "servers": [{"url":"electrum1.cipig.net:10017"}],
     });
 
     let ctx = MmCtxBuilder::new().into_mm_arc();
@@ -1388,7 +1388,7 @@ fn test_unavailable_electrum_proto_version() {
     .err()
     .unwrap();
     log!("Error: "(error));
-    assert!(error.contains("Failed protocol version verifying of at least 1 of Electrums"));
+    assert!(error.contains("There are no Electrums with the required protocol version"));
 }
 
 #[test]

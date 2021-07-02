@@ -332,7 +332,7 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
         let coin = self.coin;
         let dust: u64 = coin.as_ref().dust_amount;
         let lock_time = (now_ms() / 1000) as u32;
-        let change_script_pubkey = Builder::build_p2pkh(&coin.as_ref().my_address.hash).to_bytes();
+        let change_script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
         let coin_tx_fee = match self.fee {
             Some(f) => f,
             None => coin.get_tx_fee().await?,
@@ -411,6 +411,7 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
                 previous_output: utxo.outpoint,
                 sequence: SEQUENCE_FINAL,
                 amount: utxo.value,
+                witness: vec![],
             });
         }
 
@@ -419,6 +420,7 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
                 previous_output: utxo.outpoint.clone(),
                 sequence: SEQUENCE_FINAL,
                 amount: utxo.value,
+                witness: vec![],
             });
             sum_inputs += utxo.value;
 
@@ -1412,7 +1414,7 @@ where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
     let addr = try_s!(address_from_pubkey_str(coin, pubkey));
-    coin.display_address(&addr)
+    addr.display_address()
 }
 
 pub fn address_from_pubkey_str<T>(coin: &T, pubkey: &str) -> Result<Address, String>
@@ -1428,7 +1430,7 @@ where
         coin.as_ref().conf.bech32_hrp.clone(),
         coin.as_ref().my_address.addr_format.clone()
     ));
-    addr.display_address()
+    Ok(addr)
 }
 
 pub fn display_priv_key(coin: &UtxoCoinFields) -> String { format!("{}", coin.key_pair.private()) }

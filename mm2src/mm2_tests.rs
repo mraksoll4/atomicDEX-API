@@ -1068,7 +1068,7 @@ async fn trade_base_rel_electrum(
         {"coin":"tBCH","pubtype":0,"p2shtype":5,"mm2":1,"fork_id":"0x40","protocol":{"type":"Bch","protocol_data":{"slp_prefix":"slptest"}},"required_confirmations":0,
          "address_format":{"format":"cashaddress","network":"bchtest"}},
         {"coin":"FUSD","protocol":{"type":"SlpToken","protocol_data":{"decimals":4,"token_id":"bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7",
-         "platform":"tBCH","address_prefix":"slptest"}}}
+         "platform":"tBCH","address_prefix":"slptest"}}},
         {"coin":"JST","name":"jst","protocol":{"type":"ERC20","protocol_data":{"platform":"ETH","contract_address":"0x2b294F029Fde858b2c62184e8390591755521d8E"}}},
         {"coin":"tBTC","name":"tbitcoin","fname":"tBitcoin","pubtype":111,"p2shtype":196,"wiftype":239,"segwit":true,"bech32_hrp":"tb","txfee":0,"estimate_fee_mode":"ECONOMICAL","mm2":1,"required_confirmations":0,"protocol":{"type":"UTXO"},"address_format":{"format":"segwit"}}
     ]);
@@ -1607,7 +1607,7 @@ fn test_withdraw_and_send_from_segwit() {
             "netid": 8100,
             "myipaddr": env::var ("ALICE_TRADE_IP") .ok(),
             "rpcip": env::var ("ALICE_TRADE_IP") .ok(),
-            "passphrase": seed.to_string(),
+            "passphrase": seed,
             "coins": coins,
             "rpc_password": "password",
             "i_am_seed": true,
