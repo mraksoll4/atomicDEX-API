@@ -1,13 +1,13 @@
 use super::p2pkh_spend;
 
 use crate::utxo::bch::BchCoin;
-use crate::utxo::rpc_clients::{UnspentInfo, UtxoRpcClientEnum, UtxoRpcError};
+use crate::utxo::rpc_clients::{UnspentInfo, UtxoRpcClientEnum, UtxoRpcError, UtxoRpcResult};
 use crate::utxo::utxo_common::{self, big_decimal_from_sat_unsigned, p2sh_spend, payment_script, UtxoTxBuilder};
 use crate::utxo::{generate_and_send_tx, sat_from_big_decimal, sign_tx, ActualTxFee, FeePolicy, GenerateTxError,
                   RecentlySpentOutPoints, UtxoCoinConf, UtxoCommonOps, UtxoTx};
-use crate::{BalanceError, BalanceFut, CoinBalance, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps,
-            MmCoin, NegotiateSwapContractAddrErr, NumConversError, SwapOps, TradeFee, TradePreimageError,
-            TradePreimageFut, TradePreimageValue, TransactionDetails, TransactionEnum, TransactionFut, TxFeeDetails,
+use crate::{BalanceFut, CoinBalance, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps, MmCoin,
+            NegotiateSwapContractAddrErr, NumConversError, SwapOps, TradeFee, TradePreimageError, TradePreimageFut,
+            TradePreimageValue, TransactionDetails, TransactionEnum, TransactionFut, TxFeeDetails,
             ValidateAddressResult, WithdrawError, WithdrawFee, WithdrawFut, WithdrawRequest};
 
 use bitcoin_cash_slp::{slp_send_output, SlpTokenType, TokenId};
@@ -111,7 +111,6 @@ impl From<NumConversError> for ValidateDexFeeError {
 pub enum SpendP2SHError {
     GenerateTxErr(GenerateTxError),
     Rpc(UtxoRpcError),
-    GetUnspentsErr(SlpUnspentsErr),
     String(String),
 }
 
@@ -121,10 +120,6 @@ impl From<GenerateTxError> for SpendP2SHError {
 
 impl From<UtxoRpcError> for SpendP2SHError {
     fn from(err: UtxoRpcError) -> SpendP2SHError { SpendP2SHError::Rpc(err) }
-}
-
-impl From<SlpUnspentsErr> for SpendP2SHError {
-    fn from(err: SlpUnspentsErr) -> SpendP2SHError { SpendP2SHError::GetUnspentsErr(err) }
 }
 
 impl From<String> for SpendP2SHError {
@@ -187,78 +182,12 @@ impl SlpToken {
     /// Returns unspents of the SLP token plus plain BCH UTXOs plus RecentlySpentOutPoints mutex guard
     async fn slp_unspents(
         &self,
-    ) -> Result<
-        (
-            Vec<SlpUnspent>,
-            Vec<UnspentInfo>,
-            AsyncMutexGuard<'_, RecentlySpentOutPoints>,
-        ),
-        MmError<SlpUnspentsErr>,
-    > {
-        let (unspents, recently_spent) =
-            utxo_common::list_unspent_ordered(&self.platform_coin, &self.platform_coin.as_ref().my_address).await?;
-
-        let mut slp_unspents = vec![];
-        let mut bch_unspents = vec![];
-
-        for unspent in unspents {
-            let prev_tx_bytes = self
-                .platform_coin
-                .get_verbose_transaction_from_cache_or_rpc(unspent.outpoint.hash.reversed().into())
-                .compat()
-                .await?
-                .into_inner();
-            let prev_tx: UtxoTx = deserialize(prev_tx_bytes.hex.as_slice())?;
-            match parse_slp_script(&prev_tx.outputs[0].script_pubkey) {
-                Ok(slp_data) => match slp_data.transaction {
-                    SlpTransaction::Send { token_id, amounts } => {
-                        if token_id == self.token_id() && unspent.outpoint.index > 0 {
-                            match amounts.get(unspent.outpoint.index as usize - 1) {
-                                Some(slp_amount) => slp_unspents.push(SlpUnspent {
-                                    bch_unspent: unspent,
-                                    slp_amount: *slp_amount,
-                                }),
-                                None => bch_unspents.push(unspent),
-                            }
-                        }
-                    },
-                    SlpTransaction::Genesis {
-                        initial_token_mint_quantity,
-                        ..
-                    } => {
-                        if prev_tx.hash().reversed() == self.token_id()
-                            && initial_token_mint_quantity.len() == 8
-                            && unspent.outpoint.index == 1
-                        {
-                            let slp_amount = u64::from_be_bytes(initial_token_mint_quantity.try_into().unwrap());
-                            slp_unspents.push(SlpUnspent {
-                                bch_unspent: unspent,
-                                slp_amount,
-                            });
-                        } else {
-                            bch_unspents.push(unspent)
-                        }
-                    },
-                    SlpTransaction::Mint {
-                        token_id,
-                        additional_token_quantity,
-                        ..
-                    } => {
-                        if token_id == self.token_id() && additional_token_quantity.len() == 8 {
-                            let slp_amount = u64::from_be_bytes(additional_token_quantity.try_into().unwrap());
-                            slp_unspents.push(SlpUnspent {
-                                bch_unspent: unspent,
-                                slp_amount,
-                            });
-                        }
-                    },
-                },
-                Err(_) => bch_unspents.push(unspent),
-            }
-        }
-
-        slp_unspents.sort_by(|a, b| a.slp_amount.cmp(&b.slp_amount));
-        Ok((slp_unspents, bch_unspents, recently_spent))
+    ) -> UtxoRpcResult<(
+        Vec<SlpUnspent>,
+        Vec<UnspentInfo>,
+        AsyncMutexGuard<'_, RecentlySpentOutPoints>,
+    )> {
+        self.platform_coin.get_token_utxos(&self.conf.token_id).await
     }
 
     /// Generates the tx preimage that spends the SLP from my address to the desired destinations (script pubkeys)
@@ -677,7 +606,7 @@ impl SlpToken {
 
     fn platform_conf(&self) -> &UtxoCoinConf { &self.platform_coin.as_ref().conf }
 
-    async fn my_balance_sat(&self) -> Result<u64, MmError<SlpUnspentsErr>> {
+    async fn my_balance_sat(&self) -> UtxoRpcResult<u64> {
         let (slp_unspents, _, _) = self.slp_unspents().await?;
         let satoshi = slp_unspents.iter().fold(0, |cur, unspent| cur + unspent.slp_amount);
         Ok(satoshi)
@@ -832,41 +761,8 @@ pub fn parse_slp_script(script: &[u8]) -> Result<SlpTxDetails, MmError<ParseSlpS
 }
 
 #[derive(Debug, Display)]
-pub enum SlpUnspentsErr {
-    RpcError(UtxoRpcError),
-    #[display(fmt = "TxDeserializeError: {:?}", _0)]
-    TxDeserializeError(Error),
-}
-
-impl From<UtxoRpcError> for SlpUnspentsErr {
-    fn from(err: UtxoRpcError) -> SlpUnspentsErr { SlpUnspentsErr::RpcError(err) }
-}
-
-impl From<Error> for SlpUnspentsErr {
-    fn from(err: Error) -> SlpUnspentsErr { SlpUnspentsErr::TxDeserializeError(err) }
-}
-
-impl From<SlpUnspentsErr> for BalanceError {
-    fn from(err: SlpUnspentsErr) -> BalanceError {
-        match err {
-            SlpUnspentsErr::RpcError(e) => BalanceError::Transport(e.to_string()),
-            SlpUnspentsErr::TxDeserializeError(e) => BalanceError::Internal(format!("{:?}", e)),
-        }
-    }
-}
-
-impl From<SlpUnspentsErr> for WithdrawError {
-    fn from(err: SlpUnspentsErr) -> WithdrawError {
-        match err {
-            SlpUnspentsErr::RpcError(e) => WithdrawError::Transport(e.to_string()),
-            SlpUnspentsErr::TxDeserializeError(e) => WithdrawError::InternalError(format!("{:?}", e)),
-        }
-    }
-}
-
-#[derive(Debug, Display)]
 enum GenSlpSpendErr {
-    GetUnspentsErr(SlpUnspentsErr),
+    RpcError(UtxoRpcError),
     #[display(
         fmt = "Not enough {} to generate SLP spend: available {}, required at least {}",
         coin,
@@ -880,14 +776,14 @@ enum GenSlpSpendErr {
     },
 }
 
-impl From<SlpUnspentsErr> for GenSlpSpendErr {
-    fn from(err: SlpUnspentsErr) -> GenSlpSpendErr { GenSlpSpendErr::GetUnspentsErr(err) }
+impl From<UtxoRpcError> for GenSlpSpendErr {
+    fn from(err: UtxoRpcError) -> GenSlpSpendErr { GenSlpSpendErr::RpcError(err) }
 }
 
 impl From<GenSlpSpendErr> for WithdrawError {
     fn from(err: GenSlpSpendErr) -> WithdrawError {
         match err {
-            GenSlpSpendErr::GetUnspentsErr(e) => e.into(),
+            GenSlpSpendErr::RpcError(e) => e.into(),
             GenSlpSpendErr::InsufficientSlpBalance {
                 coin,
                 available,
@@ -1269,7 +1165,7 @@ impl From<GenSlpSpendErr> for TradePreimageError {
                 available,
                 required,
             },
-            GenSlpSpendErr::GetUnspentsErr(e) => TradePreimageError::InternalError(e.to_string()),
+            GenSlpSpendErr::RpcError(e) => e.into(),
         }
     }
 }
