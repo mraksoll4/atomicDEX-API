@@ -1592,7 +1592,6 @@ fn test_withdraw_and_send_from_segwit() {
             "segwit": true,
             "bech32_hrp": "tb",
             "txfee": 1000,
-            "estimate_fee_mode": "ECONOMICAL",
             "mm2": 1,
             "required_confirmations": 0,
             "protocol": {
@@ -1693,7 +1692,6 @@ fn test_withdraw_and_send_legacy_to_segwit() {
             "segwit": true,
             "bech32_hrp": "tb",
             "txfee": 1000,
-            "estimate_fee_mode": "ECONOMICAL",
             "mm2": 1,
             "required_confirmations": 0,
             "protocol": {
@@ -1778,7 +1776,6 @@ fn test_tbtc_withdraw_to_cashaddresses_should_fail() {
             "segwit": true,
             "bech32_hrp": "tb",
             "txfee": 1000,
-            "estimate_fee_mode": "ECONOMICAL",
             "mm2": 1,
             "required_confirmations": 0,
             "protocol": {
