@@ -61,10 +61,10 @@ impl From<serialization::Error> for IsSlpUtxoError {
 impl BchCoin {
     pub fn slp_prefix(&self) -> CashAddrPrefix { self.slp_addr_prefix }
 
-    pub async fn bch_unspents<'a>(
-        &'a self,
+    pub async fn bch_unspents(
+        &self,
         address: &Address,
-    ) -> UtxoRpcResult<(BchUnspents, AsyncMutexGuard<'a, RecentlySpentOutPoints>)> {
+    ) -> UtxoRpcResult<(BchUnspents, AsyncMutexGuard<'_, RecentlySpentOutPoints>)> {
         let (all_unspents, recently_spent) = utxo_common::list_unspent_ordered(self, address).await?;
         let mut result = BchUnspents::default();
         for unspent in all_unspents {
@@ -121,10 +121,9 @@ impl BchCoin {
                             mint_baton_vout,
                             ..
                         } => {
-                            if initial_token_mint_quantity.len() == 8 && unspent.outpoint.index == 1 {
+                            if unspent.outpoint.index == 1 {
                                 let token_id = prev_tx.hash().reversed();
-                                let slp_amount = u64::from_be_bytes(initial_token_mint_quantity.try_into().unwrap());
-                                result.add_slp(token_id, unspent, slp_amount);
+                                result.add_slp(token_id, unspent, initial_token_mint_quantity);
                             } else if Some(unspent.outpoint.index) == mint_baton_vout.map(|u| u as u32) {
                                 result.add_slp_baton(unspent);
                             } else {
@@ -136,9 +135,8 @@ impl BchCoin {
                             additional_token_quantity,
                             mint_baton_vout,
                         } => {
-                            if additional_token_quantity.len() == 8 && unspent.outpoint.index == 1 {
-                                let slp_amount = u64::from_be_bytes(additional_token_quantity.try_into().unwrap());
-                                result.add_slp(token_id, unspent, slp_amount);
+                            if unspent.outpoint.index == 1 {
+                                result.add_slp(token_id, unspent, additional_token_quantity);
                             } else if Some(unspent.outpoint.index) == mint_baton_vout.map(|u| u as u32) {
                                 result.add_slp_baton(unspent);
                             } else {
@@ -159,8 +157,8 @@ impl BchCoin {
         Ok((result, recently_spent))
     }
 
-    pub async fn get_token_utxos<'a>(
-        &'a self,
+    pub async fn get_token_utxos(
+        &self,
         token_id: &H256,
     ) -> UtxoRpcResult<(
         Vec<SlpUnspent>,
@@ -670,7 +668,7 @@ pub fn tbch_coin_for_test() -> BchCoin {
     let req = json!({
         "method": "electrum",
         "coin": "BCH",
-        "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"},{"url":"tbch.loping.net:60001"}],
+        "servers": [{"url":"blackie.c3-soft.com:60001"},{"url":"testnet.imaginary.cash:50001"},{"url":"tbch.loping.net:60001"},{"url":"electroncash.de:50003"}],
     });
     block_on(bch_coin_from_conf_and_request(
         &ctx,

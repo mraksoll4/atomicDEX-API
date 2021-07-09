@@ -626,13 +626,13 @@ pub enum SlpTransaction {
         token_document_hash: Vec<u8>,
         decimals: Vec<u8>,
         mint_baton_vout: Option<u8>,
-        initial_token_mint_quantity: Vec<u8>,
+        initial_token_mint_quantity: u64,
     },
     /// https://slp.dev/specs/slp-token-type-1/#mint-extended-minting-transaction
     Mint {
         token_id: H256,
         mint_baton_vout: Option<u8>,
-        additional_token_quantity: Vec<u8>,
+        additional_token_quantity: u64,
     },
     /// https://slp.dev/specs/slp-token-type-1/#send-spend-transaction
     Send { token_id: H256, amounts: Vec<u64> },
@@ -674,7 +674,11 @@ impl Deserializable for SlpTransaction {
                 } else {
                     Some(reader.read()?)
                 };
-                let initial_token_mint_quantity = reader.read_list()?;
+                let bytes: Vec<u8> = reader.read_list()?;
+                if bytes.len() != 8 {
+                    return Err(Error::Custom(format!("Expected 8 bytes, got {}", bytes.len())));
+                }
+                let initial_token_mint_quantity = u64::from_be_bytes(bytes.try_into().expect("length is 8 bytes"));
 
                 Ok(SlpTransaction::Genesis {
                     token_ticker,
@@ -700,10 +704,16 @@ impl Deserializable for SlpTransaction {
                     Some(reader.read()?)
                 };
 
+                let bytes: Vec<u8> = reader.read_list()?;
+                if bytes.len() != 8 {
+                    return Err(Error::Custom(format!("Expected 8 bytes, got {}", bytes.len())));
+                }
+                let additional_token_quantity = u64::from_be_bytes(bytes.try_into().expect("length is 8 bytes"));
+
                 Ok(SlpTransaction::Mint {
                     token_id: H256::from(maybe_id.as_slice()),
                     mint_baton_vout,
-                    additional_token_quantity: reader.read_list()?,
+                    additional_token_quantity,
                 })
             },
             "SEND" => {
@@ -1488,7 +1498,7 @@ mod slp_tests {
                 .unwrap();
         let slp_data = parse_slp_script(&script).unwrap();
         assert_eq!(slp_data.lokad_id, "SLP\0");
-        let initial_token_mint_quantity = 1000_0000_0000u64.to_be_bytes().to_vec();
+        let initial_token_mint_quantity = 1000_0000_0000u64;
         let expected_transaction = SlpTransaction::Genesis {
             token_ticker: "ADEX".to_string(),
             token_name: "ADEX".to_string(),
@@ -1506,7 +1516,7 @@ mod slp_tests {
             hex::decode("6a04534c500001010747454e45534953045553445423546574686572204c74642e20555320646f6c6c6172206261636b656420746f6b656e734168747470733a2f2f7465746865722e746f2f77702d636f6e74656e742f75706c6f6164732f323031362f30362f546574686572576869746550617065722e70646620db4451f11eda33950670aaf59e704da90117ff7057283b032cfaec77793139160108010208002386f26fc10000").unwrap();
         let slp_data = parse_slp_script(&script).unwrap();
         assert_eq!(slp_data.lokad_id, "SLP\0");
-        let initial_token_mint_quantity = 10000000000000000u64.to_be_bytes().to_vec();
+        let initial_token_mint_quantity = 10000000000000000u64;
         let expected_transaction = SlpTransaction::Genesis {
             token_ticker: "USDT".to_string(),
             token_name: "Tether Ltd. US dollar backed tokens".to_string(),
@@ -1528,7 +1538,7 @@ mod slp_tests {
         let expected_transaction = SlpTransaction::Mint {
             token_id: "550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35".into(),
             mint_baton_vout: Some(2),
-            additional_token_quantity: hex::decode("002386f26fc10000").unwrap(),
+            additional_token_quantity: 10000000000000000,
         };
 
         assert_eq!(expected_transaction, slp_data.transaction);

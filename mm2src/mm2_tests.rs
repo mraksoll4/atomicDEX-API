@@ -1162,9 +1162,17 @@ async fn trade_base_rel_electrum(
     );
     log! ({"enable_coins (alice): {:?}", rc});
 
-    enable_electrum(&mm_bob, "tBCH", false, &["tbch.loping.net:60001"]).await;
+    enable_electrum(&mm_bob, "tBCH", false, &[
+        "tbch.loping.net:60001",
+        "electroncash.de:50003",
+    ])
+    .await;
 
-    enable_electrum(&mm_alice, "tBCH", false, &["tbch.loping.net:60001"]).await;
+    enable_electrum(&mm_alice, "tBCH", false, &[
+        "tbch.loping.net:60001",
+        "electroncash.de:50003",
+    ])
+    .await;
 
     enable_native(&mm_bob, "FUSD", &[]).await;
     enable_native(&mm_alice, "FUSD", &[]).await;

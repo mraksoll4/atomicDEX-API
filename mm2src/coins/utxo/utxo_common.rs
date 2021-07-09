@@ -386,11 +386,7 @@ impl<'a, T: AsRef<UtxoCoinFields> + UtxoCommonOps> UtxoTxBuilder<'a, T> {
                             self.tx_fee = min_relay;
                         }
                     }
-                    if self.sum_inputs >= outputs_plus_fee {
-                        true
-                    } else {
-                        false
-                    }
+                    self.sum_inputs >= outputs_plus_fee
                 } else {
                     false
                 }
@@ -2460,7 +2456,7 @@ pub fn is_unspent_mature(mature_confirmations: u32, output: &RpcTransaction) -> 
 pub async fn get_verbose_transaction_from_cache_or_rpc(
     coin: &UtxoCoinFields,
     txid: H256Json,
-) -> Result<VerboseTransactionFrom, MmError<UtxoRpcError>> {
+) -> UtxoRpcResult<VerboseTransactionFrom> {
     let tx_cache_path = match &coin.tx_cache_directory {
         Some(p) => p.clone(),
         _ => {
@@ -2485,8 +2481,8 @@ pub async fn get_verbose_transaction_from_cache_or_rpc(
 pub async fn get_verbose_transaction_from_cache_or_rpc(
     coin: &UtxoCoinFields,
     txid: H256Json,
-) -> Result<VerboseTransactionFrom, String> {
-    let tx = try_s!(coin.rpc_client.get_verbose_transaction(txid.clone()).compat().await);
+) -> UtxoRpcResult<VerboseTransactionFrom> {
+    let tx = coin.rpc_client.get_verbose_transaction(txid.clone()).compat().await?;
     Ok(VerboseTransactionFrom::Rpc(tx))
 }
 
