@@ -33,9 +33,10 @@ pub use chain::Transaction as UtxoTx;
 use self::rpc_clients::{electrum_script_hash, UnspentInfo, UtxoRpcClientEnum, UtxoRpcClientOps, UtxoRpcResult};
 use crate::{CanRefundHtlc, CoinBalance, TradePreimageValue, TxFeeDetails, ValidateAddressResult, WithdrawResult};
 
-const MIN_BTC_TRADING_VOL: &str = "0.00777";
-pub const DEFAULT_SWAP_VOUT: usize = 0;
 pub const DEFAULT_FEE_VOUT: usize = 0;
+pub const DEFAULT_SWAP_TX_SPEND_SIZE: u64 = 305;
+pub const DEFAULT_SWAP_VOUT: usize = 0;
+const MIN_BTC_TRADING_VOL: &str = "0.00777";
 
 macro_rules! true_or {
     ($cond: expr, $etype: expr) => {
@@ -161,7 +162,7 @@ pub async fn get_tx_fee(coin: &UtxoCoinFields) -> Result<ActualTxFee, JsonRpcErr
 }
 
 /// returns the fee required to be paid for HTLC spend transaction
-pub async fn get_htlc_spend_fee<T>(coin: &T) -> UtxoRpcResult<u64>
+pub async fn get_htlc_spend_fee<T>(coin: &T, tx_size: u64) -> UtxoRpcResult<u64>
 where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
@@ -169,7 +170,7 @@ where
     let mut fee = match coin_fee {
         ActualTxFee::Fixed(fee) => fee,
         // atomic swap payment spend transaction is slightly more than 300 bytes in average as of now
-        ActualTxFee::Dynamic(fee_per_kb) => (fee_per_kb * SWAP_TX_SPEND_SIZE) / KILO_BYTE,
+        ActualTxFee::Dynamic(fee_per_kb) => (fee_per_kb * tx_size) / KILO_BYTE,
         // return satoshis here as swap spend transaction size is always less than 1 kb
         ActualTxFee::FixedPerKb(satoshis) => satoshis,
     };
@@ -784,7 +785,7 @@ where
         coin.as_ref().key_pair.public(),
     );
     let fut = async move {
-        let fee = try_s!(coin.get_htlc_spend_fee().await);
+        let fee = try_s!(coin.get_htlc_spend_fee(DEFAULT_SWAP_TX_SPEND_SIZE).await);
         let script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
         let output = TransactionOutput {
             value: prev_tx.outputs[0].value - fee,
@@ -831,7 +832,7 @@ where
         coin.as_ref().key_pair.public(),
     );
     let fut = async move {
-        let fee = try_s!(coin.get_htlc_spend_fee().await);
+        let fee = try_s!(coin.get_htlc_spend_fee(DEFAULT_SWAP_TX_SPEND_SIZE).await);
         let script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
         let output = TransactionOutput {
             value: prev_tx.outputs[0].value - fee,
@@ -875,7 +876,7 @@ where
         &try_fus!(Public::from_slice(maker_pub)),
     );
     let fut = async move {
-        let fee = try_s!(coin.get_htlc_spend_fee().await);
+        let fee = try_s!(coin.get_htlc_spend_fee(DEFAULT_SWAP_TX_SPEND_SIZE).await);
         let script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
         let output = TransactionOutput {
             value: prev_tx.outputs[0].value - fee,
@@ -919,7 +920,7 @@ where
         &try_fus!(Public::from_slice(taker_pub)),
     );
     let fut = async move {
-        let fee = try_s!(coin.get_htlc_spend_fee().await);
+        let fee = try_s!(coin.get_htlc_spend_fee(DEFAULT_SWAP_TX_SPEND_SIZE).await);
         let script_pubkey = output_script(&coin.as_ref().my_address).to_bytes();
         let output = TransactionOutput {
             value: prev_tx.outputs[0].value - fee,
@@ -2306,7 +2307,7 @@ where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps + Send + Sync + 'static,
 {
     let fut = async move {
-        let amount_sat = get_htlc_spend_fee(&coin).await?;
+        let amount_sat = get_htlc_spend_fee(&coin, DEFAULT_SWAP_TX_SPEND_SIZE).await?;
         let amount = big_decimal_from_sat_unsigned(amount_sat, coin.as_ref().decimals).into();
         Ok(TradeFee {
             coin: coin.as_ref().conf.ticker.clone(),

@@ -203,7 +203,9 @@ pub async fn bch_coin_from_conf_and_request(
 impl UtxoCommonOps for BchCoin {
     async fn get_tx_fee(&self) -> Result<ActualTxFee, JsonRpcError> { utxo_common::get_tx_fee(&self.utxo_arc).await }
 
-    async fn get_htlc_spend_fee(&self) -> UtxoRpcResult<u64> { utxo_common::get_htlc_spend_fee(self).await }
+    async fn get_htlc_spend_fee(&self, tx_size: u64) -> UtxoRpcResult<u64> {
+        utxo_common::get_htlc_spend_fee(self, tx_size).await
+    }
 
     fn addresses_from_script(&self, script: &Script) -> Result<Vec<Address>, String> {
         utxo_common::addresses_from_script(&self.utxo_arc, script)

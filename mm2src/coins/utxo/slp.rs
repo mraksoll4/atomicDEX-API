@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 const SLP_SWAP_VOUT: usize = 1;
 const SLP_FEE_VOUT: usize = 1;
+const SLP_HTLC_SPEND_SIZE: u64 = 555;
 
 #[derive(Debug)]
 pub struct SlpTokenConf {
@@ -1387,7 +1388,7 @@ impl MmCoin for SlpToken {
         let coin = self.clone();
 
         let fut = async move {
-            let htlc_fee = coin.platform_coin.get_htlc_spend_fee().await?;
+            let htlc_fee = coin.platform_coin.get_htlc_spend_fee(SLP_HTLC_SPEND_SIZE).await?;
             let amount =
                 (big_decimal_from_sat_unsigned(htlc_fee, coin.platform_decimals()) + coin.platform_dust_dec()).into();
             Ok(TradeFee {
