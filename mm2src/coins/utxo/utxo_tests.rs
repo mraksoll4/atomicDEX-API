@@ -2603,59 +2603,6 @@ fn verus_mtp() {
 }
 
 #[test]
-#[ignore]
-fn mint_slp_token() {
-    use bitcoin_cash_slp::{slp_genesis_output, SlpTokenType};
-    let ctx = MmCtxBuilder::new().into_mm_arc();
-    let conf = json!({
-        "decimals": 8,
-        "network": "regtest",
-        "confpath": "/home/artem/.bch/bch.conf",
-        "address_format": {
-            "format": "cashaddress",
-            "network": "bchreg",
-        },
-        "pubtype": 111,
-        "p2shtype": 196,
-        "dust": 546,
-    });
-    let req = json!({
-        "method": "enable",
-    });
-    let priv_key = hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap();
-    let coin = block_on(utxo_standard_coin_from_conf_and_request(
-        &ctx, "BCH", &conf, &req, &priv_key,
-    ))
-    .unwrap();
-    let address = coin.my_address().unwrap();
-    println!("{}", address);
-
-    let balance = coin.my_balance().wait().unwrap();
-    println!("{}", balance.spendable);
-
-    let output = slp_genesis_output(SlpTokenType::Fungible, "ADEX", "ADEX", "", "", 8, None, 1000_0000_0000);
-    let script_pubkey = output.script.serialize().unwrap().to_vec().into();
-
-    println!("{}", hex::encode(&script_pubkey));
-
-    let op_return_output = TransactionOutput {
-        value: output.value,
-        script_pubkey,
-    };
-    let mint_output = TransactionOutput {
-        value: 546,
-        script_pubkey: hex::decode("76a91405aab5342166f8594baf17a7d9bef5d56744332788ac")
-            .unwrap()
-            .into(),
-    };
-    block_on(send_outputs_from_my_address_impl(coin, vec![
-        op_return_output,
-        mint_output,
-    ]))
-    .unwrap();
-}
-
-#[test]
 fn sys_mtp() {
     let electrum = electrum_client_for_test(&[
         "electrum1.cipig.net:10064",

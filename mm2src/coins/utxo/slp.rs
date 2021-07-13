@@ -10,7 +10,6 @@ use crate::{BalanceFut, CoinBalance, FeeApproxStage, FoundSwapTxSpend, HistorySy
             TradePreimageValue, TransactionDetails, TransactionEnum, TransactionFut, TxFeeDetails,
             ValidateAddressResult, WithdrawError, WithdrawFee, WithdrawFut, WithdrawRequest};
 
-use bitcoin_cash_slp::{slp_send_output, SlpTokenType, TokenId};
 use bitcrypto::dhash160;
 use chain::constants::SEQUENCE_FINAL;
 use chain::{OutPoint, TransactionOutput};
@@ -161,6 +160,22 @@ impl From<UtxoRpcError> for SpendHtlcError {
     fn from(err: UtxoRpcError) -> SpendHtlcError { SpendHtlcError::RpcErr(err) }
 }
 
+fn slp_send_output(token_id: &H256, amounts: &[u64]) -> TransactionOutput {
+    let mut script_builder = ScriptBuilder::default()
+        .push_opcode(Opcode::OP_RETURN)
+        .push_data("SLP\x00".as_bytes())
+        .push_data(&[1])
+        .push_data("SEND".as_bytes())
+        .push_data(token_id.as_slice());
+    for amount in amounts {
+        script_builder = script_builder.push_data(&amount.to_be_bytes());
+    }
+    TransactionOutput {
+        value: 0,
+        script_pubkey: script_builder.into_bytes(),
+    }
+}
+
 impl SlpToken {
     pub fn new(
         decimals: u8,
@@ -177,6 +192,9 @@ impl SlpToken {
         });
         SlpToken { conf, platform_coin }
     }
+
+    /// Returns the OP_RETURN output for SLP Send transaction
+    fn send_op_ret_out(&self, amounts: &[u64]) -> TransactionOutput { slp_send_output(&self.conf.token_id, amounts) }
 
     fn rpc(&self) -> &UtxoRpcClientEnum { &self.platform_coin.as_ref().rpc_client }
 
@@ -224,16 +242,7 @@ impl SlpToken {
             amounts_for_op_return.push(change);
         }
 
-        // TODO generate the script in MM2 instead of using the external library
-        let op_return_out = slp_send_output(
-            SlpTokenType::Fungible,
-            &TokenId::from_slice(self.token_id().as_slice()).unwrap(),
-            &amounts_for_op_return,
-        );
-        let op_return_out_mm = TransactionOutput {
-            value: 0,
-            script_pubkey: op_return_out.script.serialize().unwrap().to_vec().into(),
-        };
+        let op_return_out_mm = self.send_op_ret_out(&amounts_for_op_return);
         let mut outputs = vec![op_return_out_mm];
 
         outputs.extend(slp_outputs.into_iter().map(|spend_to| TransactionOutput {
@@ -439,15 +448,7 @@ impl SlpToken {
         script_data: Script,
         redeem_script: Script,
     ) -> Result<UtxoTx, MmError<SpendP2SHError>> {
-        let op_return = slp_send_output(
-            SlpTokenType::Fungible,
-            &TokenId::from_slice(self.token_id().as_slice()).unwrap(),
-            &[p2sh_utxo.slp_amount],
-        );
-        let op_return_out_mm = TransactionOutput {
-            value: 0,
-            script_pubkey: op_return.script.serialize().unwrap().to_vec().into(),
-        };
+        let op_return_out_mm = self.send_op_ret_out(&[p2sh_utxo.slp_amount]);
         let mut outputs = Vec::with_capacity(3);
         outputs.push(op_return_out_mm);
 
@@ -1554,6 +1555,36 @@ mod slp_tests {
             amounts: vec![1000, 1001, 1002],
         };
         assert_eq!(expected_transaction, slp_data.transaction);
+    }
+
+    #[test]
+    fn test_slp_send_output() {
+        // Send single output
+        let expected_script = hex::decode("6a04534c500001010453454e4420e73b2b28c14db8ebbf97749988b539508990e1708021067f206f49d55807dbf4080000000005f5e100").unwrap();
+        let expected_output = TransactionOutput {
+            value: 0,
+            script_pubkey: expected_script.into(),
+        };
+
+        let actual_output = slp_send_output(
+            &"e73b2b28c14db8ebbf97749988b539508990e1708021067f206f49d55807dbf4".into(),
+            &[100000000],
+        );
+
+        assert_eq!(expected_output, actual_output);
+
+        let expected_script = hex::decode("6a04534c500001010453454e4420550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b350800005af3107a40000800232bff5f46c000").unwrap();
+        let expected_output = TransactionOutput {
+            value: 0,
+            script_pubkey: expected_script.into(),
+        };
+
+        let actual_output = slp_send_output(
+            &"550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35".into(),
+            &[100000000000000, 9900000000000000],
+        );
+
+        assert_eq!(expected_output, actual_output);
     }
 
     #[test]

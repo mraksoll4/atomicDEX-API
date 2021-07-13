@@ -1,5 +1,4 @@
 use super::*;
-use bitcoin_cash_slp::{slp_genesis_output, SlpTokenType};
 use chain::TransactionOutput;
 use coins::utxo::slp::SlpToken;
 use coins::utxo::utxo_common::send_outputs_from_my_address;
