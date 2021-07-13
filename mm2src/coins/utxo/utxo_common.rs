@@ -172,7 +172,14 @@ where
         // atomic swap payment spend transaction is slightly more than 300 bytes in average as of now
         ActualTxFee::Dynamic(fee_per_kb) => (fee_per_kb * tx_size) / KILO_BYTE,
         // return satoshis here as swap spend transaction size is always less than 1 kb
-        ActualTxFee::FixedPerKb(satoshis) => satoshis,
+        ActualTxFee::FixedPerKb(satoshis) => {
+            let tx_size_kb = if tx_size % KILO_BYTE == 0 {
+                tx_size / KILO_BYTE
+            } else {
+                tx_size / KILO_BYTE + 1
+            };
+            satoshis * tx_size_kb
+        },
     };
     if coin.as_ref().conf.force_min_relay_fee {
         let relay_fee = coin.as_ref().rpc_client.get_relay_fee().compat().await?;
