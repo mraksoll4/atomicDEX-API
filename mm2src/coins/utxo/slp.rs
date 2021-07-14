@@ -41,6 +41,11 @@ use std::sync::Arc;
 const SLP_SWAP_VOUT: usize = 1;
 const SLP_FEE_VOUT: usize = 1;
 const SLP_HTLC_SPEND_SIZE: u64 = 555;
+const SLP_LOKAD_ID: &str = "SLP\x00";
+const SLP_FUNGIBLE: u8 = 1;
+const SLP_SEND: &str = "SEND";
+const SLP_MINT: &str = "MINT";
+const SLP_GENESIS: &str = "GENESIS";
 
 #[derive(Debug)]
 pub struct SlpTokenConf {
@@ -163,8 +168,8 @@ impl From<UtxoRpcError> for SpendHtlcError {
 fn slp_send_output(token_id: &H256, amounts: &[u64]) -> TransactionOutput {
     let mut script_builder = ScriptBuilder::default()
         .push_opcode(Opcode::OP_RETURN)
-        .push_data("SLP\x00".as_bytes())
-        .push_data(&[1])
+        .push_data(SLP_LOKAD_ID.as_bytes())
+        .push_data(&[SLP_FUNGIBLE])
         .push_data("SEND".as_bytes())
         .push_data(token_id.as_slice());
     for amount in amounts {
@@ -648,7 +653,7 @@ impl Deserializable for SlpTransaction {
     {
         let transaction_type: String = reader.read()?;
         match transaction_type.as_str() {
-            "GENESIS" => {
+            SLP_GENESIS => {
                 let token_ticker = reader.read()?;
                 let token_name = reader.read()?;
                 let maybe_push_op_code: u8 = reader.read()?;
@@ -692,7 +697,7 @@ impl Deserializable for SlpTransaction {
                     initial_token_mint_quantity,
                 })
             },
-            "MINT" => {
+            SLP_MINT => {
                 let maybe_id: Vec<u8> = reader.read_list()?;
                 if maybe_id.len() != 32 {
                     return Err(Error::Custom(format!("Unexpected token id length {}", maybe_id.len())));
@@ -718,7 +723,7 @@ impl Deserializable for SlpTransaction {
                     additional_token_quantity,
                 })
             },
-            "SEND" => {
+            SLP_SEND => {
                 let maybe_id: Vec<u8> = reader.read_list()?;
                 if maybe_id.len() != 32 {
                     return Err(Error::Custom(format!("Unexpected token id length {}", maybe_id.len())));
@@ -749,13 +754,16 @@ impl Deserializable for SlpTransaction {
 pub struct SlpTxDetails {
     op_code: u8,
     lokad_id: String,
-    token_type: String,
+    token_type: Vec<u8>,
     pub transaction: SlpTransaction,
 }
 
-#[derive(Debug, Display)]
+#[derive(Debug, Display, PartialEq)]
 pub enum ParseSlpScriptError {
     NotOpReturn,
+    UnexpectedLokadId(String),
+    #[display(fmt = "UnexpectedTokenType: {:?}", _0)]
+    UnexpectedTokenType(Vec<u8>),
     #[display(fmt = "DeserializeFailed: {:?}", _0)]
     DeserializeFailed(Error),
 }
@@ -765,10 +773,19 @@ impl From<Error> for ParseSlpScriptError {
 }
 
 pub fn parse_slp_script(script: &[u8]) -> Result<SlpTxDetails, MmError<ParseSlpScriptError>> {
-    let details: SlpTxDetails = deserialize(script).map_to_mm(ParseSlpScriptError::from)?;
+    let details: SlpTxDetails = deserialize(script)?;
     if Opcode::from_u8(details.op_code) != Some(Opcode::OP_RETURN) {
         return MmError::err(ParseSlpScriptError::NotOpReturn);
     }
+
+    if details.lokad_id != SLP_LOKAD_ID {
+        return MmError::err(ParseSlpScriptError::UnexpectedLokadId(details.lokad_id));
+    }
+
+    if details.token_type.first() != Some(&SLP_FUNGIBLE) {
+        return MmError::err(ParseSlpScriptError::UnexpectedTokenType(details.token_type));
+    }
+
     Ok(details)
 }
 
@@ -1545,6 +1562,7 @@ mod slp_tests {
 
         assert_eq!(expected_transaction, slp_data.transaction);
 
+        // SEND with 3 outputs
         let script = hex::decode("6a04534c500001010453454e4420550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b350800000000000003e80800000000000003e90800000000000003ea").unwrap();
         let token_id = "550d19eb820e616a54b8a73372c4420b5a0567d8dc00f613b71c5234dc884b35".into();
 
@@ -1555,6 +1573,14 @@ mod slp_tests {
             amounts: vec![1000, 1001, 1002],
         };
         assert_eq!(expected_transaction, slp_data.transaction);
+
+        // NFT Genesis, unsupported token type
+        // https://explorer.bitcoin.com/bch/tx/3dc17770ff832726aace53d305e087601d8b27cf881089d7849173736995f43e
+        let script = hex::decode("6a04534c500001410747454e45534953055357454443174573736b65657469742043617264204e6f2e20313136302b68747470733a2f2f636f6c6c65637469626c652e73776565742e696f2f7365726965732f35382f313136302040f8d39b6fc8725d9c766d66643d8ec644363ba32391c1d9a89a3edbdea8866a01004c00080000000000000001").unwrap();
+
+        let actual_err = parse_slp_script(&script).unwrap_err().into_inner();
+        let expected_err = ParseSlpScriptError::UnexpectedTokenType(vec![0x41]);
+        assert_eq!(expected_err, actual_err);
     }
 
     #[test]
@@ -1585,100 +1611,6 @@ mod slp_tests {
         );
 
         assert_eq!(expected_output, actual_output);
-    }
-
-    #[test]
-    #[ignore]
-    fn send_and_spend_htlc_on_testnet() {
-        let bch = tbch_coin_for_test();
-
-        let balance = bch.my_balance().wait().unwrap();
-        println!("{}", balance.spendable);
-
-        let address = bch.my_address().unwrap();
-        println!("{}", address);
-
-        let token_id = H256::from("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7");
-        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0);
-
-        let fusd_balance = fusd.my_balance().wait().unwrap();
-        println!("FUSD {}", fusd_balance.spendable);
-
-        let secret = [0; 32];
-        let secret_hash = dhash160(&secret);
-        let time_lock = (now_ms() / 1000) as u32;
-        let amount: BigDecimal = "0.1".parse().unwrap();
-
-        let keypair = &fusd.platform_coin.as_ref().key_pair;
-
-        let tx = fusd
-            .send_taker_payment(time_lock, &*keypair.public(), &*secret_hash, amount.clone(), &None)
-            .wait()
-            .unwrap();
-        println!("{}", hex::encode(tx.tx_hex()));
-
-        fusd.validate_taker_payment(
-            &tx.tx_hex(),
-            time_lock,
-            &*keypair.public(),
-            &*secret_hash,
-            amount,
-            &None,
-        )
-        .wait()
-        .unwrap();
-
-        let spending_tx = fusd
-            .send_maker_spends_taker_payment(&tx.tx_hex(), time_lock, &*keypair.public(), &secret, &None)
-            .wait()
-            .unwrap();
-        println!("spend hex {}", hex::encode(spending_tx.tx_hex()));
-        println!("spend hash {}", hex::encode(spending_tx.tx_hash().0));
-
-        let wait_for_spend = fusd
-            .wait_for_tx_spend(&tx.tx_hex(), (now_ms() / 1000) + 60, 0, &None)
-            .wait()
-            .unwrap();
-        println!("spend hex {}", hex::encode(wait_for_spend.tx_hex()));
-        println!("spend hash {}", hex::encode(wait_for_spend.tx_hash().0));
-
-        let secret = fusd.extract_secret(&*secret_hash, &wait_for_spend.tx_hex()).unwrap();
-        println!("{:?}", secret);
-    }
-
-    #[test]
-    #[ignore]
-    fn send_and_refund_htlc_on_testnet() {
-        let bch = tbch_coin_for_test();
-
-        let balance = bch.my_balance().wait().unwrap();
-        println!("{}", balance.spendable);
-
-        let address = bch.my_address().unwrap();
-        println!("{}", address);
-
-        let token_id = H256::from("bb309e48930671582bea508f9a1d9b491e49b69be3d6f372dc08da2ac6e90eb7");
-        let fusd = SlpToken::new(4, "FUSD".into(), token_id, bch, 0);
-
-        let fusd_balance = fusd.my_balance().wait().unwrap();
-        println!("FUSD {}", fusd_balance.spendable);
-
-        let secret = [0; 32];
-        let secret_hash = dhash160(&secret);
-        let time_lock = (now_ms() / 1000) as u32 - 7200;
-
-        let tx = fusd
-            .send_taker_payment(time_lock, &[1; 33], &*secret_hash, 1.into(), &None)
-            .wait()
-            .unwrap();
-        println!("{}", hex::encode(tx.tx_hex()));
-
-        let refund_tx = fusd
-            .send_taker_refunds_payment(&tx.tx_hex(), time_lock, &[1; 33], &*secret_hash, &None)
-            .wait()
-            .unwrap();
-        println!("refund hex {}", hex::encode(refund_tx.tx_hex()));
-        println!("refund hash {}", hex::encode(refund_tx.tx_hash().0));
     }
 
     #[test]
