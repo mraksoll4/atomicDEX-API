@@ -710,12 +710,3 @@ pub fn bch_coin_for_test() -> BchCoin {
     ))
     .unwrap()
 }
-
-#[cfg(test)]
-mod bch_tests {
-    use super::{bch_coin_for_test, tbch_coin_for_test};
-    use crate::utxo::rpc_clients::UnspentInfo;
-    use chain::OutPoint;
-    use common::block_on;
-    use keys::hash::H256;
-}

@@ -94,21 +94,27 @@ mod docker_tests {
     use crate::mm2::mm2_tests::structs::*;
     use bigdecimal::BigDecimal;
     use bitcrypto::ChecksumType;
-    use chain::OutPoint;
-    use coins::utxo::rpc_clients::{UnspentInfo, UtxoRpcClientEnum, UtxoRpcClientOps};
+    use chain::{OutPoint, TransactionOutput};
+    use coins::utxo::bch::{bch_coin_from_conf_and_request, BchCoin};
+    use coins::utxo::rpc_clients::{NativeClient, UnspentInfo, UtxoRpcClientEnum, UtxoRpcClientOps};
+    use coins::utxo::slp::SlpToken;
+    use coins::utxo::slp::{slp_genesis_output, SlpOutput};
+    use coins::utxo::utxo_common::send_outputs_from_my_address;
     use coins::utxo::utxo_standard::{utxo_standard_coin_from_conf_and_request, UtxoStandardCoin};
     use coins::utxo::{coin_daemon_data_dir, dhash160, zcash_params_path, UtxoCoinFields, UtxoCommonOps};
-    use coins::{FoundSwapTxSpend, MarketCoinOps, MmCoin, SwapOps, TransactionEnum, WithdrawRequest};
+    use coins::{FoundSwapTxSpend, MarketCoinOps, MmCoin, SwapOps, Transaction, TransactionEnum, WithdrawRequest};
     use common::for_tests::enable_electrum;
     use common::mm_number::MmNumber;
+    use common::privkey::key_pair_from_secret;
     use common::{block_on, now_ms};
     use common::{file_lock::FileLock,
                  for_tests::{enable_native, mm_dump, new_mm2_temp_folder_path, MarketMakerIt},
                  mm_ctx::{MmArc, MmCtxBuilder}};
     use futures01::Future;
-    use keys::{KeyPair, Private};
-    use primitives::hash::H160;
+    use keys::{Address, KeyPair, NetworkPrefix as CashAddrPrefix, Private};
+    use primitives::hash::{H160, H256};
     use qrc20_tests::{qtum_docker_node, QtumDockerOps, QTUM_REGTEST_DOCKER_IMAGE};
+    use script::Builder;
     use secp256k1::{PublicKey, SecretKey};
     use serde_json::{self as json, Value as Json};
     use std::collections::HashMap;
@@ -128,6 +134,10 @@ mod docker_tests {
         let public = PublicKey::from_secret_key(&secret);
         dhash160(&public.serialize_compressed())
     }
+
+    pub fn get_prefilled_slp_privkey() -> [u8; 32] { SLP_TOKEN_OWNERS.lock().unwrap().remove(0) }
+
+    pub fn get_slp_token_id() -> String { hex::encode(SLP_TOKEN_ID.lock().unwrap().as_slice()) }
 
     const UTXO_ASSET_DOCKER_IMAGE: &str = "artempikulin/testblockchain";
 
@@ -153,19 +163,24 @@ mod docker_tests {
             let utxo_node = utxo_asset_docker_node(&docker, "MYCOIN", 7000);
             let utxo_node1 = utxo_asset_docker_node(&docker, "MYCOIN1", 8000);
             let qtum_node = qtum_docker_node(&docker, 9000);
+            let for_slp_node = utxo_asset_docker_node(&docker, "FORSLP", 10000);
 
             let utxo_ops = UtxoAssetDockerOps::from_ticker("MYCOIN");
             let utxo_ops1 = UtxoAssetDockerOps::from_ticker("MYCOIN1");
             let qtum_ops = QtumDockerOps::new();
+            let for_slp_ops = BchDockerOps::from_ticker("FORSLP");
 
             utxo_ops.wait_ready();
             utxo_ops1.wait_ready();
             qtum_ops.wait_ready();
             qtum_ops.initialize_contracts();
+            for_slp_ops.wait_ready();
+            for_slp_ops.initialize_slp();
 
             containers.push(utxo_node);
             containers.push(utxo_node1);
             containers.push(qtum_node);
+            containers.push(for_slp_node);
         }
         // detect if docker is installed
         // skip the tests that use docker if not installed
@@ -219,6 +234,13 @@ mod docker_tests {
     trait CoinDockerOps {
         fn rpc_client(&self) -> &UtxoRpcClientEnum;
 
+        fn native_client(&self) -> &NativeClient {
+            match self.rpc_client() {
+                UtxoRpcClientEnum::Native(native) => native,
+                _ => panic!("UtxoRpcClientEnum::Native is expected"),
+            }
+        }
+
         fn wait_ready(&self) {
             let timeout = now_ms() + 30000;
             loop {
@@ -257,6 +279,105 @@ mod docker_tests {
             ))
             .unwrap();
             UtxoAssetDockerOps { ctx, coin }
+        }
+    }
+
+    struct BchDockerOps {
+        #[allow(dead_code)]
+        ctx: MmArc,
+        coin: BchCoin,
+    }
+
+    impl CoinDockerOps for BchDockerOps {
+        fn rpc_client(&self) -> &UtxoRpcClientEnum { &self.coin.as_ref().rpc_client }
+    }
+
+    impl BchDockerOps {
+        fn from_ticker(ticker: &str) -> BchDockerOps {
+            let conf = json!({"asset": ticker,"txfee":1000,"network": "regtest","txversion":4,"overwintered":1});
+            let req = json!({"method":"enable"});
+            let priv_key = hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap();
+            let ctx = MmCtxBuilder::new().into_mm_arc();
+            let coin = block_on(bch_coin_from_conf_and_request(
+                &ctx,
+                ticker,
+                &conf,
+                &req,
+                CashAddrPrefix::SlpTest,
+                &priv_key,
+            ))
+            .unwrap();
+            BchDockerOps { ctx, coin }
+        }
+
+        fn initialize_slp(&self) {
+            fill_address(&self.coin, &self.coin.my_address().unwrap(), 100000.into(), 30);
+            let mut slp_privkeys = vec![];
+
+            let slp_genesis_op_ret = slp_genesis_output("ADEXSLP", "ADEXSLP", None, None, 8, None, 1000000_00000000);
+            let slp_genesis = TransactionOutput {
+                value: self.coin.as_ref().dust_amount,
+                script_pubkey: Builder::build_p2pkh(&self.coin.my_public_key().address_hash()).to_bytes(),
+            };
+
+            let mut bch_outputs = vec![slp_genesis_op_ret, slp_genesis];
+            let mut slp_outputs = vec![];
+
+            for _ in 0..18 {
+                let priv_key = SecretKey::random(&mut rand4::thread_rng()).serialize();
+                let key_pair = key_pair_from_secret(priv_key).unwrap();
+                let address_hash = key_pair.public().address_hash();
+                let address = Address {
+                    prefix: self.coin.as_ref().conf.pub_addr_prefix,
+                    t_addr_prefix: self.coin.as_ref().conf.pub_t_addr_prefix,
+                    hrp: None,
+                    hash: address_hash.clone(),
+                    checksum_type: Default::default(),
+                    addr_format: Default::default(),
+                };
+
+                self.native_client()
+                    .import_address(&address.to_string(), &address.to_string(), false)
+                    .wait()
+                    .unwrap();
+
+                let script_pubkey = Builder::build_p2pkh(&address_hash);
+
+                bch_outputs.push(TransactionOutput {
+                    value: 1000_00000000,
+                    script_pubkey: script_pubkey.to_bytes(),
+                });
+
+                slp_outputs.push(SlpOutput {
+                    amount: 1000_00000000,
+                    script_pubkey: script_pubkey.to_bytes(),
+                });
+                slp_privkeys.push(priv_key);
+            }
+
+            let slp_genesis_tx = send_outputs_from_my_address(self.coin.clone(), bch_outputs)
+                .wait()
+                .unwrap();
+            self.coin
+                .wait_for_confirmations(&slp_genesis_tx.tx_hex(), 1, false, now_ms() / 1000 + 30, 1)
+                .wait()
+                .unwrap();
+
+            let adex_slp = SlpToken::new(
+                8,
+                "ADEXSLP".into(),
+                slp_genesis_tx.tx_hash().as_slice().into(),
+                self.coin.clone(),
+                1,
+            );
+
+            let tx = block_on(adex_slp.send_slp_outputs(slp_outputs)).unwrap();
+            self.coin
+                .wait_for_confirmations(&tx.tx_hex(), 1, false, now_ms() / 1000 + 30, 1)
+                .wait()
+                .unwrap();
+            *SLP_TOKEN_OWNERS.lock().unwrap() = slp_privkeys;
+            *SLP_TOKEN_ID.lock().unwrap() = slp_genesis_tx.tx_hash().as_slice().into();
         }
     }
 
@@ -316,6 +437,11 @@ mod docker_tests {
 
     lazy_static! {
         static ref COINS_LOCK: Mutex<()> = Mutex::new(());
+        static ref SLP_TOKEN_ID: Mutex<H256> = Mutex::new(H256::default());
+        // Private keys supplied with 1000 SLP tokens on tests initialization.
+        // Due to the SLP protocol limitations only 19 outputs (18 + change) can be sent in one transaction, which is sufficient for now though.
+        // Supply more privkeys when 18 will be not enough.
+        static ref SLP_TOKEN_OWNERS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::with_capacity(18));
     }
 
     /// Build asset `UtxoStandardCoin` from ticker and privkey without filling the balance.
@@ -331,8 +457,11 @@ mod docker_tests {
         (ctx, coin)
     }
 
-    /// Generate random privkey, create a coin and fill it's address with the specified balance.
-    fn generate_coin_with_random_privkey(ticker: &str, balance: BigDecimal) -> (MmArc, UtxoStandardCoin, [u8; 32]) {
+    /// Generate random privkey, create a UTXO coin and fill it's address with the specified balance.
+    fn generate_utxo_coin_with_random_privkey(
+        ticker: &str,
+        balance: BigDecimal,
+    ) -> (MmArc, UtxoStandardCoin, [u8; 32]) {
         let priv_key = SecretKey::random(&mut rand4::thread_rng()).serialize();
         let (ctx, coin) = utxo_coin_from_privkey(ticker, &priv_key);
         let timeout = 30; // timeout if test takes more than 30 seconds to run
@@ -389,7 +518,7 @@ mod docker_tests {
     #[test]
     fn test_search_for_swap_tx_spend_native_was_refunded_taker() {
         let timeout = (now_ms() / 1000) + 120; // timeout if test takes more than 120 seconds to run
-        let (_ctx, coin, _) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, _) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
 
         let time_lock = (now_ms() / 1000) as u32 - 3600;
         let tx = coin
@@ -420,7 +549,7 @@ mod docker_tests {
     #[test]
     fn test_search_for_swap_tx_spend_native_was_refunded_maker() {
         let timeout = (now_ms() / 1000) + 120; // timeout if test takes more than 120 seconds to run
-        let (_ctx, coin, _) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, _) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
 
         let time_lock = (now_ms() / 1000) as u32 - 3600;
         let tx = coin
@@ -451,7 +580,7 @@ mod docker_tests {
     #[test]
     fn test_search_for_taker_swap_tx_spend_native_was_spent_by_maker() {
         let timeout = (now_ms() / 1000) + 120; // timeout if test takes more than 120 seconds to run
-        let (_ctx, coin, _) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, _) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let secret = [0; 32];
 
         let time_lock = (now_ms() / 1000) as u32 - 3600;
@@ -490,7 +619,7 @@ mod docker_tests {
     #[test]
     fn test_search_for_maker_swap_tx_spend_native_was_spent_by_taker() {
         let timeout = (now_ms() / 1000) + 120; // timeout if test takes more than 120 seconds to run
-        let (_ctx, coin, _) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, _) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let secret = [0; 32];
 
         let time_lock = (now_ms() / 1000) as u32 - 3600;
@@ -529,7 +658,7 @@ mod docker_tests {
     #[test]
     fn test_one_hundred_maker_payments_in_a_row_native() {
         let timeout = 30; // timeout if test takes more than 30 seconds to run
-        let (_ctx, coin, _) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, _) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         fill_address(&coin, &coin.my_address().unwrap(), 2.into(), timeout);
         let secret = [0; 32];
 
@@ -586,7 +715,7 @@ mod docker_tests {
     // https://github.com/KomodoPlatform/atomicDEX-API/issues/554
     #[test]
     fn order_should_be_cancelled_when_entire_balance_is_withdrawn() {
-        let (_ctx, _, priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -704,7 +833,7 @@ mod docker_tests {
 
     #[test]
     fn order_should_be_updated_when_balance_is_decreased_alice_subscribes_after_update() {
-        let (_ctx, _, priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -840,7 +969,7 @@ mod docker_tests {
 
     #[test]
     fn order_should_be_updated_when_balance_is_decreased_alice_subscribes_before_update() {
-        let (_ctx, _, priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -992,8 +1121,8 @@ mod docker_tests {
 
     #[test]
     fn test_order_should_be_updated_when_matched_partially() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 2000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 2000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -1101,8 +1230,8 @@ mod docker_tests {
     // https://github.com/KomodoPlatform/atomicDEX-API/issues/471
     #[test]
     fn test_match_and_trade_setprice_max() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -1204,8 +1333,8 @@ mod docker_tests {
     #[test]
     // https://github.com/KomodoPlatform/atomicDEX-API/issues/888
     fn test_max_taker_vol_swap() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 50.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 50.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -1325,8 +1454,8 @@ mod docker_tests {
 
     #[test]
     fn test_buy_when_coins_locked_by_other_swap() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -1422,8 +1551,8 @@ mod docker_tests {
 
     #[test]
     fn test_sell_when_coins_locked_by_other_swap() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -1519,7 +1648,7 @@ mod docker_tests {
 
     #[test]
     fn test_buy_max() {
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 1.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 1.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2204,7 +2333,7 @@ mod docker_tests {
 
     #[test]
     fn test_get_max_taker_vol() {
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 1.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 1.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2259,7 +2388,8 @@ mod docker_tests {
     // https://github.com/KomodoPlatform/atomicDEX-API/issues/733
     #[test]
     fn test_get_max_taker_vol_dex_fee_threshold() {
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", "0.05328455".parse().unwrap());
+        let (_ctx, _, alice_priv_key) =
+            generate_utxo_coin_with_random_privkey("MYCOIN1", "0.05328455".parse().unwrap());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
@@ -2320,7 +2450,7 @@ mod docker_tests {
     #[test]
     fn test_get_max_taker_vol_dust_threshold() {
         // first, try to test with the balance slightly less than required
-        let (_ctx, coin, priv_key) = generate_coin_with_random_privkey("MYCOIN1", "0.001656".parse().unwrap());
+        let (_ctx, coin, priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", "0.001656".parse().unwrap());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"},"dust":72800},
@@ -2374,7 +2504,7 @@ mod docker_tests {
 
     #[test]
     fn test_get_max_taker_vol_with_kmd() {
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 1.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 1.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
@@ -2435,7 +2565,7 @@ mod docker_tests {
 
     #[test]
     fn test_set_price_max() {
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2492,8 +2622,8 @@ mod docker_tests {
 
     #[test]
     fn swaps_should_stop_on_stop_rpc() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2589,7 +2719,7 @@ mod docker_tests {
 
     #[test]
     fn test_maker_order_should_kick_start_and_appear_in_orderbook_on_restart() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2649,7 +2779,7 @@ mod docker_tests {
 
     #[test]
     fn test_maker_order_should_not_kick_start_and_appear_in_orderbook_if_balance_is_withdrawn() {
-        let (_ctx, coin, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2742,8 +2872,8 @@ mod docker_tests {
 
     #[test]
     fn test_maker_order_kick_start_should_trigger_subscription_and_match() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 1000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 1000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2838,8 +2968,8 @@ mod docker_tests {
 
     #[test]
     fn test_orders_should_match_on_both_nodes_with_same_priv() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -2945,8 +3075,8 @@ mod docker_tests {
 
     #[test]
     fn test_maker_and_taker_order_created_with_same_priv_should_not_match() {
-        let (_ctx, coin, priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, coin1, _) = generate_coin_with_random_privkey("MYCOIN1", 1000.into());
+        let (_ctx, coin, priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin1, _) = generate_utxo_coin_with_random_privkey("MYCOIN1", 1000.into());
         fill_address(&coin1, &coin.my_address().unwrap(), 1000.into(), 30);
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -3022,8 +3152,8 @@ mod docker_tests {
 
     #[test]
     fn test_taker_order_converted_to_maker_should_cancel_properly_when_matched() {
-        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
-        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2000.into());
+        let (_ctx, _, bob_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_utxo_coin_with_random_privkey("MYCOIN1", 2000.into());
         let coins = json! ([
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
@@ -3144,7 +3274,7 @@ mod docker_tests {
     #[test]
     fn test_utxo_merge() {
         let timeout = 30; // timeout if test takes more than 30 seconds to run
-        let (_ctx, coin, privkey) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, privkey) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         // fill several times to have more UTXOs on address
         fill_address(&coin, &coin.my_address().unwrap(), 2.into(), timeout);
         fill_address(&coin, &coin.my_address().unwrap(), 2.into(), timeout);
@@ -3200,7 +3330,7 @@ mod docker_tests {
     #[test]
     fn test_utxo_merge_max_merge_at_once() {
         let timeout = 30; // timeout if test takes more than 30 seconds to run
-        let (_ctx, coin, privkey) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, coin, privkey) = generate_utxo_coin_with_random_privkey("MYCOIN", 1000.into());
         // fill several times to have more UTXOs on address
         fill_address(&coin, &coin.my_address().unwrap(), 2.into(), timeout);
         fill_address(&coin, &coin.my_address().unwrap(), 2.into(), timeout);

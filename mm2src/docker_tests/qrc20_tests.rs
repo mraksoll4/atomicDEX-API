@@ -435,6 +435,8 @@ fn trade_base_rel((base, rel): (&str, &str)) {
 
                 priv_key
             },
+            "ADEXSLP" => get_prefilled_slp_privkey(),
+            "FORSLP" => get_prefilled_slp_privkey(),
             _ => panic!("Expected either QICK or QORTY or MYCOIN or MYCOIN1, found {}", ticker),
         }
     }
@@ -450,6 +452,8 @@ fn trade_base_rel((base, rel): (&str, &str)) {
         {"coin":"MYCOIN1","asset":"MYCOIN1","required_confirmations":0,"txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         {"coin":"QTUM","asset":"QTUM","required_confirmations":0,"decimals":8,"pubtype":120,"p2shtype":110,"wiftype":128,"segwit":true,"txfee":0,"txfee_volatility_percent":0.1,
         "mm2":1,"network":"regtest","confpath":confpath,"protocol":{"type":"UTXO"},"bech32_hrp":"qcrt","address_format":{"format":"segwit"}},
+        {"coin":"FORSLP","asset":"FORSLP","required_confirmations":0,"txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"BCH","protocol_data":{"slp_prefix":"slptest"}}},
+        {"coin":"ADEXSLP","protocol":{"type":"SLPTOKEN","protocol_data":{"decimals":8,"token_id":get_slp_token_id(),"platform":"FORSLP"}}}
     ]);
     let mut mm_bob = MarketMakerIt::start(
         json! ({
@@ -490,12 +494,16 @@ fn trade_base_rel((base, rel): (&str, &str)) {
     log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
     log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
     log!([block_on(enable_native(&mm_bob, "QTUM", &[]))]);
+    log!([block_on(enable_native(&mm_bob, "FORSLP", &[]))]);
+    log!([block_on(enable_native(&mm_bob, "ADEXSLP", &[]))]);
 
     log!([block_on(enable_qrc20_native(&mm_alice, "QICK"))]);
     log!([block_on(enable_qrc20_native(&mm_alice, "QORTY"))]);
     log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
     log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
     log!([block_on(enable_native(&mm_alice, "QTUM", &[]))]);
+    log!([block_on(enable_native(&mm_alice, "FORSLP", &[]))]);
+    log!([block_on(enable_native(&mm_alice, "ADEXSLP", &[]))]);
     let rc = block_on(mm_bob.rpc(json! ({
         "userpass": mm_bob.userpass,
         "method": "setprice",
@@ -507,7 +515,7 @@ fn trade_base_rel((base, rel): (&str, &str)) {
     .unwrap();
     assert!(rc.0.is_success(), "!setprice: {}", rc.1);
 
-    thread::sleep(Duration::from_secs(12));
+    thread::sleep(Duration::from_secs(1));
 
     log!("Issue alice " (base) "/" (rel) " buy request");
     let rc = block_on(mm_alice.rpc(json! ({
@@ -1841,6 +1849,12 @@ fn trade_test_with_maker_segwit() { trade_base_rel(("QTUM", "MYCOIN")); }
 
 #[test]
 fn trade_test_with_taker_segwit() { trade_base_rel(("MYCOIN", "QTUM")); }
+
+#[test]
+fn trade_test_with_maker_slp() { trade_base_rel(("ADEXSLP", "FORSLP")); }
+
+#[test]
+fn trade_test_with_taker_slp() { trade_base_rel(("FORSLP", "ADEXSLP")); }
 
 #[test]
 #[ignore]

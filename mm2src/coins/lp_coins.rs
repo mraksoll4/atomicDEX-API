@@ -1026,13 +1026,13 @@ pub enum CoinProtocol {
         platform: String,
         contract_address: String,
     },
-    SlpToken {
+    SLPTOKEN {
         platform: String,
         token_id: H256Json,
         decimals: u8,
         required_confirmations: Option<u64>,
     },
-    Bch {
+    BCH {
         slp_prefix: String,
     },
     #[cfg(all(not(target_arch = "wasm32"), feature = "zhtlc"))]
@@ -1242,12 +1242,12 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
             )
             .into()
         },
-        CoinProtocol::Bch { slp_prefix } => {
+        CoinProtocol::BCH { slp_prefix } => {
             let prefix = try_s!(CashAddrPrefix::from_str(&slp_prefix));
             let bch = try_s!(bch_coin_from_conf_and_request(ctx, ticker, &coins_en, req, prefix, secret).await);
             bch.into()
         },
-        CoinProtocol::SlpToken {
+        CoinProtocol::SLPTOKEN {
             platform,
             token_id,
             decimals,
@@ -1731,10 +1731,10 @@ pub fn address_by_coin_conf_and_pubkey_str(
     let protocol: CoinProtocol = try_s!(json::from_value(conf["protocol"].clone()));
     match protocol {
         CoinProtocol::ERC20 { .. } | CoinProtocol::ETH => eth::addr_from_pubkey_str(pubkey),
-        CoinProtocol::UTXO | CoinProtocol::QTUM | CoinProtocol::QRC20 { .. } | CoinProtocol::Bch { .. } => {
+        CoinProtocol::UTXO | CoinProtocol::QTUM | CoinProtocol::QRC20 { .. } | CoinProtocol::BCH { .. } => {
             utxo::address_by_conf_and_pubkey_str(coin, conf, pubkey)
         },
-        CoinProtocol::SlpToken { platform, .. } => {
+        CoinProtocol::SLPTOKEN { platform, .. } => {
             let platform_conf = coin_conf(&ctx, &platform);
             if platform_conf.is_null() {
                 return ERR!("platform {} conf is null", platform);
@@ -1742,7 +1742,7 @@ pub fn address_by_coin_conf_and_pubkey_str(
             // TODO is there any way to make it better without duplicating the prefix in the SLP conf?
             let platform_protocol: CoinProtocol = try_s!(json::from_value(platform_conf["protocol"].clone()));
             match platform_protocol {
-                CoinProtocol::Bch { slp_prefix } => {
+                CoinProtocol::BCH { slp_prefix } => {
                     slp_addr_from_pubkey_str(pubkey, &slp_prefix).map_err(|e| ERRL!("{}", e))
                 },
                 _ => ERR!("Platform protocol {:?} is not BCH", platform_protocol),

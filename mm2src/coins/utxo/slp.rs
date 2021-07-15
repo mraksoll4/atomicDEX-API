@@ -68,9 +68,9 @@ pub struct SlpUnspent {
 }
 
 #[derive(Clone, Debug)]
-struct SlpOutput {
-    amount: u64,
-    script_pubkey: Bytes,
+pub struct SlpOutput {
+    pub amount: u64,
+    pub script_pubkey: Bytes,
 }
 
 /// The SLP transaction preimage
@@ -170,11 +170,57 @@ fn slp_send_output(token_id: &H256, amounts: &[u64]) -> TransactionOutput {
         .push_opcode(Opcode::OP_RETURN)
         .push_data(SLP_LOKAD_ID.as_bytes())
         .push_data(&[SLP_FUNGIBLE])
-        .push_data("SEND".as_bytes())
+        .push_data(SLP_SEND.as_bytes())
         .push_data(token_id.as_slice());
     for amount in amounts {
         script_builder = script_builder.push_data(&amount.to_be_bytes());
     }
+    TransactionOutput {
+        value: 0,
+        script_pubkey: script_builder.into_bytes(),
+    }
+}
+
+pub fn slp_genesis_output(
+    ticker: &str,
+    name: &str,
+    token_document_url: Option<&str>,
+    token_document_hash: Option<H256>,
+    decimals: u8,
+    mint_baton_vout: Option<u8>,
+    initial_token_mint_quantity: u64,
+) -> TransactionOutput {
+    let mut script_builder = ScriptBuilder::default()
+        .push_opcode(Opcode::OP_RETURN)
+        .push_data(SLP_LOKAD_ID.as_bytes())
+        .push_data(&[SLP_FUNGIBLE])
+        .push_data(SLP_GENESIS.as_bytes())
+        .push_data(ticker.as_bytes())
+        .push_data(name.as_bytes());
+
+    script_builder = match token_document_url {
+        Some(url) => script_builder.push_data(url.as_bytes()),
+        None => script_builder
+            .push_opcode(Opcode::OP_PUSHDATA1)
+            .push_opcode(Opcode::OP_0),
+    };
+
+    script_builder = match token_document_hash {
+        Some(hash) => script_builder.push_data(hash.as_slice()),
+        None => script_builder
+            .push_opcode(Opcode::OP_PUSHDATA1)
+            .push_opcode(Opcode::OP_0),
+    };
+
+    script_builder = script_builder.push_data(&[decimals]);
+    script_builder = match mint_baton_vout {
+        Some(vout) => script_builder.push_data(&[vout]),
+        None => script_builder
+            .push_opcode(Opcode::OP_PUSHDATA1)
+            .push_opcode(Opcode::OP_0),
+    };
+
+    script_builder = script_builder.push_data(&initial_token_mint_quantity.to_be_bytes());
     TransactionOutput {
         value: 0,
         script_pubkey: script_builder.into_bytes(),
@@ -219,6 +265,11 @@ impl SlpToken {
         &self,
         slp_outputs: Vec<SlpOutput>,
     ) -> Result<SlpTxPreimage<'_>, MmError<GenSlpSpendErr>> {
+        // the limit is 19, but we may require the change to be added
+        if slp_outputs.len() > 18 {
+            return MmError::err(GenSlpSpendErr::TooManyOutputs);
+        }
+
         let (slp_unspents, bch_unspents, recently_spent) = self.slp_unspents().await?;
         let total_slp_output = slp_outputs.iter().fold(0, |cur, slp_out| cur + slp_out.amount);
         let mut total_slp_input = 0;
@@ -270,6 +321,19 @@ impl SlpToken {
             outputs,
             recently_spent,
         })
+    }
+
+    pub async fn send_slp_outputs(&self, slp_outputs: Vec<SlpOutput>) -> Result<UtxoTx, String> {
+        let preimage = try_s!(self.generate_slp_tx_preimage(slp_outputs).await);
+        generate_and_send_tx(
+            &self.platform_coin,
+            preimage.available_bch_inputs,
+            Some(preimage.slp_inputs),
+            FeePolicy::SendExact,
+            preimage.recently_spent,
+            preimage.outputs,
+        )
+        .await
     }
 
     async fn send_htlc(
@@ -740,6 +804,12 @@ impl Deserializable for SlpTransaction {
                     amounts.push(amount)
                 }
 
+                if amounts.len() > 19 {
+                    return Err(Error::Custom(format!(
+                        "Expected at most 19 token amounts, got {}",
+                        amounts.len()
+                    )));
+                }
                 Ok(SlpTransaction::Send { token_id, amounts })
             },
             _ => Err(Error::Custom(format!(
@@ -792,6 +862,7 @@ pub fn parse_slp_script(script: &[u8]) -> Result<SlpTxDetails, MmError<ParseSlpS
 #[derive(Debug, Display)]
 enum GenSlpSpendErr {
     RpcError(UtxoRpcError),
+    TooManyOutputs,
     #[display(
         fmt = "Not enough {} to generate SLP spend: available {}, required at least {}",
         coin,
@@ -813,6 +884,7 @@ impl From<GenSlpSpendErr> for WithdrawError {
     fn from(err: GenSlpSpendErr) -> WithdrawError {
         match err {
             GenSlpSpendErr::RpcError(e) => e.into(),
+            GenSlpSpendErr::TooManyOutputs => WithdrawError::InternalError(err.to_string()),
             GenSlpSpendErr::InsufficientSlpBalance {
                 coin,
                 available,
@@ -1195,6 +1267,7 @@ impl From<GenSlpSpendErr> for TradePreimageError {
                 required,
             },
             GenSlpSpendErr::RpcError(e) => e.into(),
+            GenSlpSpendErr::TooManyOutputs => TradePreimageError::InternalError(slp.to_string()),
         }
     }
 }
@@ -1463,7 +1536,7 @@ impl MmCoin for SlpToken {
     }
 
     fn set_requires_notarization(&self, _requires_nota: bool) {
-        warn!("set_requires_notarization has no effect on SlpToken!")
+        warn!("set_requires_notarization has no effect on SLPTOKEN!")
     }
 
     fn swap_contract_address(&self) -> Option<BytesJson> { None }
@@ -1494,7 +1567,6 @@ pub fn slp_addr_from_pubkey_str(pubkey: &str, prefix: &str) -> Result<String, Mm
 mod slp_tests {
     use super::*;
     use crate::utxo::bch::tbch_coin_for_test;
-    use common::now_ms;
 
     // https://slp.dev/specs/slp-token-type-1/#examples
     #[test]
@@ -1610,6 +1682,39 @@ mod slp_tests {
             &[100000000000000, 9900000000000000],
         );
 
+        assert_eq!(expected_output, actual_output);
+    }
+
+    #[test]
+    fn test_slp_genesis_output() {
+        let expected_script =
+            hex::decode("6a04534c500001010747454e45534953044144455804414445584c004c0001084c0008000000174876e800")
+                .unwrap();
+        let expected_output = TransactionOutput {
+            value: 0,
+            script_pubkey: expected_script.into(),
+        };
+
+        let actual_output = slp_genesis_output("ADEX", "ADEX", None, None, 8, None, 1000_0000_0000);
+        assert_eq!(expected_output, actual_output);
+
+        let expected_script =
+            hex::decode("6a04534c500001010747454e45534953045553445423546574686572204c74642e20555320646f6c6c6172206261636b656420746f6b656e734168747470733a2f2f7465746865722e746f2f77702d636f6e74656e742f75706c6f6164732f323031362f30362f546574686572576869746550617065722e70646620db4451f11eda33950670aaf59e704da90117ff7057283b032cfaec77793139160108010208002386f26fc10000")
+                .unwrap();
+        let expected_output = TransactionOutput {
+            value: 0,
+            script_pubkey: expected_script.into(),
+        };
+
+        let actual_output = slp_genesis_output(
+            "USDT",
+            "Tether Ltd. US dollar backed tokens",
+            Some("https://tether.to/wp-content/uploads/2016/06/TetherWhitePaper.pdf"),
+            Some("db4451f11eda33950670aaf59e704da90117ff7057283b032cfaec7779313916".into()),
+            8,
+            Some(2),
+            10000000000000000,
+        );
         assert_eq!(expected_output, actual_output);
     }
 
