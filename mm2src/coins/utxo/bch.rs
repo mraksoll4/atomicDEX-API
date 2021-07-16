@@ -1,6 +1,7 @@
 use super::*;
 use crate::utxo::rpc_clients::UtxoRpcFut;
 use crate::utxo::slp::{parse_slp_script, SlpTransaction, SlpUnspent};
+use crate::utxo::utxo_common::big_decimal_from_sat_unsigned;
 use crate::{CanRefundHtlc, CoinBalance, NegotiateSwapContractAddrErr, SwapOps, TradePreimageValue,
             ValidateAddressResult, WithdrawFut};
 use common::log::warn;
@@ -503,12 +504,37 @@ impl SwapOps for BchCoin {
     }
 }
 
+fn total_unspent_value<'a>(unspents: impl IntoIterator<Item = &'a UnspentInfo>) -> u64 {
+    unspents.into_iter().fold(0, |cur, unspent| cur + unspent.value)
+}
+
 impl MarketCoinOps for BchCoin {
     fn ticker(&self) -> &str { &self.utxo_arc.conf.ticker }
 
     fn my_address(&self) -> Result<String, String> { utxo_common::my_address(self) }
 
-    fn my_balance(&self) -> BalanceFut<CoinBalance> { utxo_common::my_balance(&self.utxo_arc) }
+    fn my_balance(&self) -> BalanceFut<CoinBalance> {
+        let coin = self.clone();
+        let fut = async move {
+            let (bch_unspents, _recently_spent) = coin.bch_unspents(&coin.as_ref().my_address).await?;
+            let spendable_sat = total_unspent_value(&bch_unspents.standard);
+
+            let unspendable_slp = bch_unspents.slp.iter().fold(0, |cur, (_, slp_unspents)| {
+                let bch_value = total_unspent_value(slp_unspents.iter().map(|slp| &slp.bch_unspent));
+                cur + bch_value
+            });
+
+            let unspendable_slp_batons = total_unspent_value(&bch_unspents.slp_batons);
+            let unspendable_undetermined = total_unspent_value(&bch_unspents.undetermined);
+
+            let total_unspendable = unspendable_slp + unspendable_slp_batons + unspendable_undetermined;
+            Ok(CoinBalance {
+                spendable: big_decimal_from_sat_unsigned(spendable_sat, coin.as_ref().decimals),
+                unspendable: big_decimal_from_sat_unsigned(total_unspendable, coin.as_ref().decimals),
+            })
+        };
+        Box::new(fut.boxed().compat())
+    }
 
     fn base_coin_balance(&self) -> BalanceFut<BigDecimal> { utxo_common::base_coin_balance(self) }
 

@@ -82,6 +82,8 @@ mod docker_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod docker_tests {
     #[rustfmt::skip]
+    mod docker_tests_common;
+    #[rustfmt::skip]
     mod qrc20_tests;
     #[rustfmt::skip]
     mod slp_tests;
@@ -90,18 +92,18 @@ mod docker_tests {
     #[rustfmt::skip]
     mod swaps_file_lock_tests;
 
-    use crate::mm2::lp_swap::dex_fee_amount;
-    use crate::mm2::mm2_tests::structs::*;
+    use docker_tests_common::*;
+
     use bigdecimal::BigDecimal;
     use bitcrypto::ChecksumType;
     use chain::{OutPoint, TransactionOutput};
     use coins::utxo::bch::{bch_coin_from_conf_and_request, BchCoin};
-    use coins::utxo::rpc_clients::{NativeClient, UnspentInfo, UtxoRpcClientEnum, UtxoRpcClientOps};
+    use coins::utxo::rpc_clients::{UnspentInfo, UtxoRpcClientEnum};
     use coins::utxo::slp::SlpToken;
     use coins::utxo::slp::{slp_genesis_output, SlpOutput};
     use coins::utxo::utxo_common::send_outputs_from_my_address;
     use coins::utxo::utxo_standard::{utxo_standard_coin_from_conf_and_request, UtxoStandardCoin};
-    use coins::utxo::{coin_daemon_data_dir, dhash160, zcash_params_path, UtxoCoinFields, UtxoCommonOps};
+    use coins::utxo::{dhash160, UtxoCommonOps};
     use coins::{FoundSwapTxSpend, MarketCoinOps, MmCoin, SwapOps, Transaction, TransactionEnum, WithdrawRequest};
     use common::for_tests::enable_electrum;
     use common::mm_number::MmNumber;
@@ -112,34 +114,18 @@ mod docker_tests {
                  mm_ctx::{MmArc, MmCtxBuilder}};
     use futures01::Future;
     use keys::{Address, KeyPair, NetworkPrefix as CashAddrPrefix, Private};
-    use primitives::hash::{H160, H256};
     use qrc20_tests::{qtum_docker_node, QtumDockerOps, QTUM_REGTEST_DOCKER_IMAGE};
     use script::Builder;
-    use secp256k1::{PublicKey, SecretKey};
+    use secp256k1::SecretKey;
     use serde_json::{self as json, Value as Json};
     use std::collections::HashMap;
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::process::Command;
-    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
     use test::{test_main, StaticBenchFn, StaticTestFn, TestDescAndFn};
     use testcontainers::clients::Cli;
-    use testcontainers::images::generic::{GenericImage, WaitFor};
-    use testcontainers::{Container, Docker, Image};
-
-    fn rmd160_from_priv(privkey: [u8; 32]) -> H160 {
-        let secret = SecretKey::parse(&privkey).unwrap();
-        let public = PublicKey::from_secret_key(&secret);
-        dhash160(&public.serialize_compressed())
-    }
-
-    pub fn get_prefilled_slp_privkey() -> [u8; 32] { SLP_TOKEN_OWNERS.lock().unwrap().remove(0) }
-
-    pub fn get_slp_token_id() -> String { hex::encode(SLP_TOKEN_ID.lock().unwrap().as_slice()) }
-
-    const UTXO_ASSET_DOCKER_IMAGE: &str = "artempikulin/testblockchain";
 
     // AP: custom test runner is intended to initialize the required environment (e.g. coin daemons in the docker containers)
     // and then gracefully clear it by dropping the RAII docker container handlers
@@ -228,33 +214,6 @@ mod docker_tests {
                 .args(ids)
                 .status()
                 .expect("Failed to execute docker command");
-        }
-    }
-
-    trait CoinDockerOps {
-        fn rpc_client(&self) -> &UtxoRpcClientEnum;
-
-        fn native_client(&self) -> &NativeClient {
-            match self.rpc_client() {
-                UtxoRpcClientEnum::Native(native) => native,
-                _ => panic!("UtxoRpcClientEnum::Native is expected"),
-            }
-        }
-
-        fn wait_ready(&self) {
-            let timeout = now_ms() + 30000;
-            loop {
-                match self.rpc_client().get_block_count().wait() {
-                    Ok(n) => {
-                        if n > 1 {
-                            break;
-                        }
-                    },
-                    Err(e) => log!([e]),
-                }
-                assert!(now_ms() < timeout, "Test timed out");
-                thread::sleep(Duration::from_secs(1));
-            }
         }
     }
 
@@ -381,82 +340,6 @@ mod docker_tests {
         }
     }
 
-    pub struct UtxoDockerNode<'a> {
-        #[allow(dead_code)]
-        container: Container<'a, Cli, GenericImage>,
-        #[allow(dead_code)]
-        ticker: String,
-        #[allow(dead_code)]
-        port: u16,
-    }
-
-    fn utxo_asset_docker_node<'a>(docker: &'a Cli, ticker: &'static str, port: u16) -> UtxoDockerNode<'a> {
-        let args = vec![
-            "-v".into(),
-            format!("{}:/data/.zcash-params", zcash_params_path().display()),
-            "-p".into(),
-            format!("127.0.0.1:{}:{}", port, port).into(),
-        ];
-        let image = GenericImage::new(UTXO_ASSET_DOCKER_IMAGE)
-            .with_args(args)
-            .with_env_var("CLIENTS", "2")
-            .with_env_var("CHAIN", ticker)
-            .with_env_var("TEST_ADDY", "R9imXLs1hEcU9KbFDQq2hJEEJ1P5UoekaF")
-            .with_env_var("TEST_WIF", "UqqW7f766rADem9heD8vSBvvrdfJb3zg5r8du9rJxPtccjWf7RG9")
-            .with_env_var(
-                "TEST_PUBKEY",
-                "021607076d7a2cb148d542fb9644c04ffc22d2cca752f80755a0402a24c567b17a",
-            )
-            .with_env_var("DAEMON_URL", "http://test:test@127.0.0.1:7000")
-            .with_env_var("COIN", "Komodo")
-            .with_env_var("COIN_RPC_PORT", port.to_string())
-            .with_wait_for(WaitFor::message_on_stdout("config is ready"));
-        let container = docker.run(image);
-        let mut conf_path = coin_daemon_data_dir(ticker, true);
-        std::fs::create_dir_all(&conf_path).unwrap();
-        conf_path.push(format!("{}.conf", ticker));
-        Command::new("docker")
-            .arg("cp")
-            .arg(format!("{}:/data/node_0/{}.conf", container.id(), ticker))
-            .arg(&conf_path)
-            .status()
-            .expect("Failed to execute docker command");
-        let timeout = now_ms() + 3000;
-        loop {
-            if conf_path.exists() {
-                break;
-            };
-            assert!(now_ms() < timeout, "Test timed out");
-        }
-        UtxoDockerNode {
-            container,
-            ticker: ticker.into(),
-            port,
-        }
-    }
-
-    lazy_static! {
-        static ref COINS_LOCK: Mutex<()> = Mutex::new(());
-        static ref SLP_TOKEN_ID: Mutex<H256> = Mutex::new(H256::default());
-        // Private keys supplied with 1000 SLP tokens on tests initialization.
-        // Due to the SLP protocol limitations only 19 outputs (18 + change) can be sent in one transaction, which is sufficient for now though.
-        // Supply more privkeys when 18 will be not enough.
-        static ref SLP_TOKEN_OWNERS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::with_capacity(18));
-    }
-
-    /// Build asset `UtxoStandardCoin` from ticker and privkey without filling the balance.
-    fn utxo_coin_from_privkey(ticker: &str, priv_key: &[u8]) -> (MmArc, UtxoStandardCoin) {
-        let ctx = MmCtxBuilder::new().into_mm_arc();
-        let conf = json!({"asset":ticker,"txversion":4,"overwintered":1,"txfee":1000,"network":"regtest"});
-        let req = json!({"method":"enable"});
-        let coin = block_on(utxo_standard_coin_from_conf_and_request(
-            &ctx, ticker, &conf, &req, priv_key,
-        ))
-        .unwrap();
-        import_address(&coin);
-        (ctx, coin)
-    }
-
     /// Generate random privkey, create a UTXO coin and fill it's address with the specified balance.
     fn generate_utxo_coin_with_random_privkey(
         ticker: &str,
@@ -468,51 +351,6 @@ mod docker_tests {
         let my_address = coin.my_address().expect("!my_address");
         fill_address(&coin, &my_address, balance, timeout);
         (ctx, coin, priv_key)
-    }
-
-    fn import_address<T>(coin: &T)
-    where
-        T: MarketCoinOps + AsRef<UtxoCoinFields>,
-    {
-        match coin.as_ref().rpc_client {
-            UtxoRpcClientEnum::Native(ref native) => {
-                let my_address = coin.my_address().unwrap();
-                native.import_address(&my_address, &my_address, false).wait().unwrap()
-            },
-            UtxoRpcClientEnum::Electrum(_) => panic!("Expected NativeClient"),
-        }
-    }
-
-    fn fill_address<T>(coin: &T, address: &str, amount: BigDecimal, timeout: u64)
-    where
-        T: MarketCoinOps + AsRef<UtxoCoinFields>,
-    {
-        // prevent concurrent fill since daemon RPC returns errors if send_to_address
-        // is called concurrently (insufficient funds) and it also may return other errors
-        // if previous transaction is not confirmed yet
-        let _lock = COINS_LOCK.lock().unwrap();
-        let timeout = now_ms() / 1000 + timeout;
-
-        if let UtxoRpcClientEnum::Native(client) = &coin.as_ref().rpc_client {
-            client.import_address(address, address, false).wait().unwrap();
-            let hash = client.send_to_address(address, &amount).wait().unwrap();
-            let tx_bytes = client.get_transaction_bytes(hash).wait().unwrap();
-            coin.wait_for_confirmations(&tx_bytes, 1, false, timeout, 1)
-                .wait()
-                .unwrap();
-            log!({ "{:02x}", tx_bytes });
-            loop {
-                let unspents = client
-                    .list_unspent_impl(0, std::i32::MAX, vec![address.to_string()])
-                    .wait()
-                    .unwrap();
-                if !unspents.is_empty() {
-                    break;
-                }
-                assert!(now_ms() / 1000 < timeout, "Test timed out");
-                thread::sleep(Duration::from_secs(1));
-            }
-        };
     }
 
     #[test]
