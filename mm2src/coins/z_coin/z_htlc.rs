@@ -8,8 +8,8 @@
 use super::z_rpc::{ZOperationStatus, ZOperationTxid, ZSendManyItem};
 use super::ZCoin;
 use crate::utxo::rpc_clients::{UtxoRpcClientEnum, UtxoRpcError};
-use crate::utxo::sat_from_big_decimal;
 use crate::utxo::utxo_common::{big_decimal_from_sat_unsigned, dex_fee_script, payment_script};
+use crate::utxo::{sat_from_big_decimal, UtxoAddressFormat};
 use bigdecimal::BigDecimal;
 use bitcrypto::dhash160;
 use chain::Transaction as UtxoTx;
@@ -56,6 +56,8 @@ pub async fn z_send_htlc(
         t_addr_prefix: coin.utxo_arc.conf.p2sh_t_addr_prefix,
         hash,
         checksum_type: coin.utxo_arc.conf.checksum_type,
+        addr_format: UtxoAddressFormat::Standard,
+        hrp: None,
     };
 
     let amount_sat = sat_from_big_decimal(&amount, coin.utxo_arc.decimals).expect("temporary code");
@@ -117,6 +119,8 @@ pub async fn z_send_dex_fee(
         t_addr_prefix: coin.utxo_arc.conf.p2sh_t_addr_prefix,
         hash,
         checksum_type: coin.utxo_arc.conf.checksum_type,
+        addr_format: UtxoAddressFormat::Standard,
+        hrp: None,
     };
 
     let amount_sat = sat_from_big_decimal(&amount, coin.utxo_arc.decimals).expect("temporary code");
@@ -158,11 +162,13 @@ pub async fn z_send_dex_fee(
                     .await?;
                 let tx: UtxoTx = deserialize(tx_bytes.0.as_slice()).expect("rpc returns valid tx bytes");
 
+                /*
                 coin.rpc_client()
                     .wait_for_confirmations(&tx, 1, false, now_ms() / 1000 + 120, 1)
                     .compat()
                     .await
                     .unwrap();
+                 */
                 break Ok((tx, payment_script));
             },
             None => break Err(MmError::new(ZSendHtlcError::ZOperationStatusesEmpty)),

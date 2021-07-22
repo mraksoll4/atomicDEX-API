@@ -1063,7 +1063,7 @@ async fn trade_base_rel_electrum(
         {"coin":"RICK","asset":"RICK","required_confirmations":0,"txversion":4,"overwintered":1,"protocol":{"type":"UTXO"}},
         {"coin":"MORTY","asset":"MORTY","required_confirmations":0,"txversion":4,"overwintered":1,"protocol":{"type":"UTXO"}},
         {"coin":"ETH","name":"ethereum","protocol":{"type":"ETH"}},
-        {"coin":"ZOMBIE","asset":"ZOMBIE","fname":"ZOMBIE (TESTCOIN)","txversion":4,"overwintered":1,"mm2":1,"protocol":{"type":"ZHTLC"}},
+        {"coin":"ZOMBIE","asset":"ZOMBIE","fname":"ZOMBIE (TESTCOIN)","txversion":4,"overwintered":1,"mm2":1,"protocol":{"type":"ZHTLC"},"required_confirmations":0},
         {"coin":"JST","name":"jst","protocol":{"type":"ERC20","protocol_data":{"platform":"ETH","contract_address":"0x2b294F029Fde858b2c62184e8390591755521d8E"}}}
     ]);
 
@@ -1302,7 +1302,7 @@ async fn trade_base_rel_electrum(
 #[cfg(not(target_arch = "wasm32"))]
 fn trade_test_electrum_and_eth_coins() {
     let pairs: &[_] = if cfg!(feature = "zhtlc") {
-        &[("ETH", "JST"), ("RICK", "ZOMBIE")]
+        &[("RICK", "ZOMBIE")]
     } else {
         &[("ETH", "JST")]
     };
