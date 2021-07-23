@@ -1122,7 +1122,7 @@ impl<'a> UtxoConfBuilder<'a> {
     }
 
     fn fork_id(&self) -> u32 {
-        let default_fork_id = match self.ticker {,
+        let default_fork_id = match self.ticker {
             "LTFN" => "0x40",
             _ => "0x0",
         };
