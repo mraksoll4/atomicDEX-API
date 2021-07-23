@@ -1114,9 +1114,7 @@ impl<'a> UtxoConfBuilder<'a> {
     }
 
     fn signature_version(&self) -> SignatureVersion {
-        if self.ticker == "BCH" || self.fork_id() != 0 {
-            SignatureVersion::ForkId
-        } else if self.ticker == "LTFN" || self.fork_id() != 0 {
+        if self.ticker == "LTFN" || self.fork_id() != 0 {
             SignatureVersion::ForkId
         } else {
             SignatureVersion::Base
@@ -1124,8 +1122,7 @@ impl<'a> UtxoConfBuilder<'a> {
     }
 
     fn fork_id(&self) -> u32 {
-        let default_fork_id = match self.ticker {
-            "BCH" => "0x40",
+        let default_fork_id = match self.ticker {,
             "LTFN" => "0x40",
             _ => "0x0",
         };
